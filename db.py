@@ -8,80 +8,134 @@ import streamlit as st
 from supabase import Client, create_client
 
 
-DEMO_PATIENT_ID = "11111111-1111-1111-1111-111111111111"
+AUTH_STATE_KEYS = (
+    "access_token",
+    "refresh_token",
+    "auth_user_id",
+)
 
 
 class DatabaseConfigError(RuntimeError):
-    """Raised when Supabase credentials are missing or incomplete."""
+    """Raised when the public Supabase credentials are missing or incomplete."""
 
 
-@st.cache_resource
-def get_supabase() -> Client:
+class AuthenticationError(RuntimeError):
+    """Raised when the current Streamlit session is not authenticated."""
+
+
+def _public_config() -> tuple[str, str]:
     try:
         cfg = st.secrets["supabase"]
         url = str(cfg["url"]).strip()
-        # Supabase recomienda las nuevas Secret keys (sb_secret_...).
-        # Se conserva fallback a service_role_key para proyectos legacy.
-        key = str(cfg.get("secret_key", cfg.get("service_role_key", ""))).strip()
+        key = str(cfg.get("publishable_key", cfg.get("anon_key", ""))).strip()
     except (KeyError, FileNotFoundError) as exc:
         raise DatabaseConfigError(
-            "Faltan los secretos de Supabase. Configura [supabase].url y "
-            "[supabase].secret_key en Streamlit Secrets."
+            "Faltan las credenciales públicas de Supabase. Configura "
+            "[supabase].url y [supabase].publishable_key en Streamlit Secrets."
         ) from exc
 
     if not url or not key:
-        raise DatabaseConfigError("Las credenciales de Supabase están vacías.")
+        raise DatabaseConfigError("Las credenciales públicas de Supabase están vacías.")
+    if key.startswith("sb_secret_"):
+        raise DatabaseConfigError(
+            "La app multiusuario no debe usar una Secret key. Configura una "
+            "Publishable key que empiece con sb_publishable_."
+        )
+    return url, key
 
+
+def create_public_client() -> Client:
+    url, key = _public_config()
     return create_client(url, key)
 
 
-def ensure_demo_patient(patient_id: str = DEMO_PATIENT_ID) -> None:
-    """Create the single-patient MVP rows if they do not exist yet."""
-    db = get_supabase()
+def _save_session(session: Any) -> None:
+    if session is None:
+        return
+    st.session_state["access_token"] = session.access_token
+    st.session_state["refresh_token"] = session.refresh_token
+    if getattr(session, "user", None) is not None:
+        st.session_state["auth_user_id"] = str(session.user.id)
 
-    patient = (
-        db.table("patients")
-        .select("id")
-        .eq("id", patient_id)
-        .limit(1)
+
+def clear_auth_session() -> None:
+    for key in AUTH_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def sign_up(email: str, password: str, full_name: str) -> bool:
+    """Register a patient. Returns True when email confirmation is pending."""
+    client = create_public_client()
+    response = client.auth.sign_up(
+        {
+            "email": email.strip().lower(),
+            "password": password,
+            "options": {"data": {"full_name": full_name.strip()}},
+        }
+    )
+    if response.session is None:
+        return True
+    _save_session(response.session)
+    return False
+
+
+def sign_in(email: str, password: str) -> None:
+    client = create_public_client()
+    response = client.auth.sign_in_with_password(
+        {"email": email.strip().lower(), "password": password}
+    )
+    if response.session is None:
+        raise AuthenticationError("Supabase no devolvió una sesión válida.")
+    _save_session(response.session)
+
+
+def get_supabase() -> Client:
+    access_token = st.session_state.get("access_token")
+    refresh_token = st.session_state.get("refresh_token")
+    if not access_token or not refresh_token:
+        raise AuthenticationError("Inicia sesión para continuar.")
+
+    client = create_public_client()
+    try:
+        response = client.auth.set_session(access_token, refresh_token)
+    except Exception as exc:
+        clear_auth_session()
+        raise AuthenticationError(
+            "Tu sesión venció. Inicia sesión nuevamente."
+        ) from exc
+
+    _save_session(response.session)
+    return client
+
+
+def sign_out() -> None:
+    try:
+        get_supabase().auth.sign_out()
+    finally:
+        clear_auth_session()
+
+
+def get_auth_context() -> dict[str, Any]:
+    client = get_supabase()
+    user_response = client.auth.get_user()
+    user = user_response.user
+    if user is None:
+        clear_auth_session()
+        raise AuthenticationError("No se encontró el usuario autenticado.")
+
+    response = (
+        client.table("profiles")
+        .select("id,role,full_name,patient_id,invite_code")
+        .eq("id", str(user.id))
+        .single()
         .execute()
     )
-
-    if not patient.data:
-        db.table("patients").insert(
-            {
-                "id": patient_id,
-                "name": "Paciente demo",
-                "age": 30,
-                "sex": "Femenino",
-                "weight": 65.0,
-                "height": 165.0,
-            }
-        ).execute()
-
-    goals = (
-        db.table("goals")
-        .select("patient_id")
-        .eq("patient_id", patient_id)
-        .limit(1)
-        .execute()
-    )
-
-    if not goals.data:
-        db.table("goals").insert(
-            {
-                "patient_id": patient_id,
-                "calories": 2000.0,
-                "protein": 120.0,
-                "carbs": 220.0,
-                "fat": 65.0,
-                "fiber": 30.0,
-                "water": 2500.0,
-            }
-        ).execute()
+    profile = dict(response.data)
+    profile["email"] = str(user.email or "")
+    return profile
 
 
-def get_profile(patient_id: str = DEMO_PATIENT_ID) -> dict[str, Any]:
+def get_profile(patient_id: str) -> dict[str, Any]:
     response = (
         get_supabase()
         .table("patients")
@@ -94,12 +148,12 @@ def get_profile(patient_id: str = DEMO_PATIENT_ID) -> dict[str, Any]:
 
 
 def update_profile(
+    patient_id: str,
     name: str,
     age: int,
     sex: str,
     weight: float,
     height: float,
-    patient_id: str = DEMO_PATIENT_ID,
 ) -> None:
     (
         get_supabase()
@@ -118,7 +172,7 @@ def update_profile(
     )
 
 
-def get_goals(patient_id: str = DEMO_PATIENT_ID) -> dict[str, Any]:
+def get_goals(patient_id: str) -> dict[str, Any]:
     response = (
         get_supabase()
         .table("goals")
@@ -131,13 +185,13 @@ def get_goals(patient_id: str = DEMO_PATIENT_ID) -> dict[str, Any]:
 
 
 def update_goals(
+    patient_id: str,
     calories: float,
     protein: float,
     carbs: float,
     fat: float,
     fiber: float,
     water: float,
-    patient_id: str = DEMO_PATIENT_ID,
 ) -> None:
     (
         get_supabase()
@@ -158,10 +212,7 @@ def update_goals(
     )
 
 
-def get_day_log(
-    selected_date: date,
-    patient_id: str = DEMO_PATIENT_ID,
-) -> pd.DataFrame:
+def get_day_log(selected_date: date, patient_id: str) -> pd.DataFrame:
     response = (
         get_supabase()
         .table("food_log")
@@ -192,6 +243,7 @@ def get_day_log(
 
 
 def save_food(
+    patient_id: str,
     selected_date: date,
     meal: str,
     food: str,
@@ -203,7 +255,6 @@ def save_food(
     fat: float,
     fiber: float,
     water: float,
-    patient_id: str = DEMO_PATIENT_ID,
 ) -> None:
     (
         get_supabase()
@@ -228,7 +279,7 @@ def save_food(
     )
 
 
-def delete_food(food_id: int, patient_id: str = DEMO_PATIENT_ID) -> None:
+def delete_food(food_id: int, patient_id: str) -> None:
     (
         get_supabase()
         .table("food_log")
@@ -239,7 +290,7 @@ def delete_food(food_id: int, patient_id: str = DEMO_PATIENT_ID) -> None:
     )
 
 
-def get_history(patient_id: str = DEMO_PATIENT_ID) -> pd.DataFrame:
+def get_history(patient_id: str) -> pd.DataFrame:
     """Fetch raw rows with pagination; aggregation is performed in pandas."""
     db = get_supabase()
     page_size = 1000
@@ -271,3 +322,37 @@ def get_history(patient_id: str = DEMO_PATIENT_ID) -> pd.DataFrame:
         "water",
     ]
     return pd.DataFrame(rows, columns=columns)
+
+
+def list_assigned_patients() -> list[dict[str, Any]]:
+    db = get_supabase()
+    links = db.table("nutritionist_patients").select("patient_id").execute().data or []
+    patient_ids = [str(row["patient_id"]) for row in links]
+    if not patient_ids:
+        return []
+    response = (
+        db.table("patients")
+        .select("id,name,age,sex,weight,height")
+        .in_("id", patient_ids)
+        .order("name")
+        .execute()
+    )
+    return [dict(row) for row in (response.data or [])]
+
+
+def patient_has_nutritionist(patient_id: str) -> bool:
+    response = (
+        get_supabase()
+        .table("nutritionist_patients")
+        .select("nutritionist_id")
+        .eq("patient_id", patient_id)
+        .limit(1)
+        .execute()
+    )
+    return bool(response.data)
+
+
+def link_nutritionist(invite_code: str) -> None:
+    get_supabase().rpc(
+        "link_my_nutritionist", {"p_invite_code": invite_code.strip().upper()}
+    ).execute()

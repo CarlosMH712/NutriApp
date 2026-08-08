@@ -1,7 +1,9 @@
--- Mi Nutrición - esquema inicial para Supabase/PostgreSQL
--- Ejecutar una sola vez desde Supabase > SQL Editor.
+-- Mi Nutrición V0.3 - Supabase Auth, múltiples pacientes y RLS.
+-- Este script sirve tanto para una instalación nueva como para actualizar V0.2.
+-- Ejecutar desde Supabase > SQL Editor con el rol postgres.
 
 create extension if not exists pgcrypto;
+create schema if not exists private;
 
 create table if not exists public.patients (
     id uuid primary key default gen_random_uuid(),
@@ -16,12 +18,12 @@ create table if not exists public.patients (
 
 create table if not exists public.goals (
     patient_id uuid primary key references public.patients(id) on delete cascade,
-    calories numeric(10,2) not null default 0 check (calories >= 0),
-    protein numeric(10,2) not null default 0 check (protein >= 0),
-    carbs numeric(10,2) not null default 0 check (carbs >= 0),
-    fat numeric(10,2) not null default 0 check (fat >= 0),
-    fiber numeric(10,2) not null default 0 check (fiber >= 0),
-    water numeric(10,2) not null default 0 check (water >= 0),
+    calories numeric(10,2) not null default 2000 check (calories >= 0),
+    protein numeric(10,2) not null default 120 check (protein >= 0),
+    carbs numeric(10,2) not null default 220 check (carbs >= 0),
+    fat numeric(10,2) not null default 65 check (fat >= 0),
+    fiber numeric(10,2) not null default 30 check (fiber >= 0),
+    water numeric(10,2) not null default 2500 check (water >= 0),
     updated_at timestamptz not null default now()
 );
 
@@ -42,41 +44,354 @@ create table if not exists public.food_log (
     created_at timestamptz not null default now()
 );
 
+create table if not exists public.profiles (
+    id uuid primary key references auth.users(id) on delete cascade,
+    role text not null default 'patient' check (role in ('patient', 'nutritionist')),
+    full_name text not null,
+    patient_id uuid unique references public.patients(id) on delete set null,
+    invite_code text not null unique default upper(encode(gen_random_bytes(5), 'hex')),
+    created_at timestamptz not null default now()
+);
+
+create table if not exists public.nutritionist_patients (
+    nutritionist_id uuid not null references public.profiles(id) on delete cascade,
+    patient_id uuid not null unique references public.patients(id) on delete cascade,
+    created_at timestamptz not null default now(),
+    primary key (nutritionist_id, patient_id)
+);
+
 create index if not exists idx_food_log_patient_date
     on public.food_log(patient_id, log_date);
+create index if not exists idx_nutritionist_patients_nutritionist
+    on public.nutritionist_patients(nutritionist_id);
 
--- La app usa service_role desde el servidor de Streamlit.
--- Habilitamos RLS y NO creamos políticas públicas; de esta manera,
--- una publishable/anon key no puede leer ni escribir estas tablas.
+-- Cada alta de Supabase Auth crea automáticamente expediente, perfil y metas.
+create or replace function public.handle_new_auth_user()
+returns trigger
+language plpgsql
+security definer set search_path = ''
+as $$
+declare
+    new_name text;
+begin
+    new_name := coalesce(
+        nullif(trim(new.raw_user_meta_data ->> 'full_name'), ''),
+        split_part(coalesce(new.email, 'Paciente'), '@', 1),
+        'Paciente'
+    );
+
+    insert into public.patients (id, name)
+    values (new.id, new_name)
+    on conflict (id) do nothing;
+
+    insert into public.profiles (id, role, full_name, patient_id)
+    values (new.id, 'patient', new_name, new.id)
+    on conflict (id) do nothing;
+
+    insert into public.goals (patient_id)
+    values (new.id)
+    on conflict (patient_id) do nothing;
+
+    return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+    after insert on auth.users
+    for each row execute procedure public.handle_new_auth_user();
+
+-- Si ya existían usuarios Auth antes de ejecutar esta migración, los completa.
+do $$
+declare
+    existing_user record;
+    existing_name text;
+begin
+    for existing_user in select * from auth.users loop
+        existing_name := coalesce(
+            nullif(trim(existing_user.raw_user_meta_data ->> 'full_name'), ''),
+            split_part(coalesce(existing_user.email, 'Paciente'), '@', 1),
+            'Paciente'
+        );
+        insert into public.patients (id, name)
+        values (existing_user.id, existing_name)
+        on conflict (id) do nothing;
+        insert into public.profiles (id, role, full_name, patient_id)
+        values (existing_user.id, 'patient', existing_name, existing_user.id)
+        on conflict (id) do nothing;
+        insert into public.goals (patient_id)
+        values (existing_user.id)
+        on conflict (patient_id) do nothing;
+    end loop;
+end;
+$$;
+
+-- Funciones auxiliares privadas para políticas sin recursión RLS.
+create or replace function private.current_patient_id()
+returns uuid
+language sql
+stable
+security definer set search_path = ''
+as $$
+    select p.patient_id
+    from public.profiles p
+    where p.id = (select auth.uid())
+$$;
+
+create or replace function private.is_nutritionist()
+returns boolean
+language sql
+stable
+security definer set search_path = ''
+as $$
+    select coalesce(
+        (select p.role = 'nutritionist'
+         from public.profiles p
+         where p.id = (select auth.uid())),
+        false
+    )
+$$;
+
+create or replace function private.can_access_patient(target_patient_id uuid)
+returns boolean
+language sql
+stable
+security definer set search_path = ''
+as $$
+    select target_patient_id is not null and (
+        target_patient_id = (select private.current_patient_id())
+        or exists (
+            select 1
+            from public.nutritionist_patients np
+            where np.nutritionist_id = (select auth.uid())
+              and np.patient_id = target_patient_id
+        )
+    )
+$$;
+
+create or replace function private.can_manage_goals(target_patient_id uuid)
+returns boolean
+language sql
+stable
+security definer set search_path = ''
+as $$
+    select target_patient_id is not null and (
+        exists (
+            select 1
+            from public.nutritionist_patients np
+            where np.nutritionist_id = (select auth.uid())
+              and np.patient_id = target_patient_id
+        )
+        or (
+            target_patient_id = (select private.current_patient_id())
+            and not exists (
+                select 1
+                from public.nutritionist_patients np
+                where np.patient_id = target_patient_id
+            )
+        )
+    )
+$$;
+
+create or replace function private.can_view_profile(target_user_id uuid)
+returns boolean
+language sql
+stable
+security definer set search_path = ''
+as $$
+    select target_user_id = (select auth.uid())
+       or exists (
+            select 1
+            from public.profiles target_profile
+            join public.nutritionist_patients np
+              on np.patient_id = target_profile.patient_id
+            where target_profile.id = target_user_id
+              and np.nutritionist_id = (select auth.uid())
+       )
+       or exists (
+            select 1
+            from public.nutritionist_patients np
+            where np.nutritionist_id = target_user_id
+              and np.patient_id = (select private.current_patient_id())
+       )
+$$;
+
+-- El paciente usa el código compartido por su nutriólogo.
+create or replace function public.link_my_nutritionist(p_invite_code text)
+returns uuid
+language plpgsql
+security definer set search_path = ''
+as $$
+declare
+    current_patient uuid;
+    selected_nutritionist uuid;
+begin
+    select p.patient_id into current_patient
+    from public.profiles p
+    where p.id = (select auth.uid()) and p.role = 'patient';
+
+    if current_patient is null then
+        raise exception 'La cuenta no corresponde a un paciente';
+    end if;
+
+    select p.id into selected_nutritionist
+    from public.profiles p
+    where p.role = 'nutritionist'
+      and p.invite_code = upper(trim(p_invite_code));
+
+    if selected_nutritionist is null then
+        raise exception 'Código de nutriólogo inválido';
+    end if;
+
+    insert into public.nutritionist_patients (nutritionist_id, patient_id)
+    values (selected_nutritionist, current_patient)
+    on conflict (patient_id) do update
+        set nutritionist_id = excluded.nutritionist_id;
+
+    return selected_nutritionist;
+end;
+$$;
+
+-- Función administrativa: sólo se ejecuta manualmente en SQL Editor.
+create or replace function public.promote_user_to_nutritionist(p_email text)
+returns text
+language plpgsql
+security definer set search_path = ''
+as $$
+declare
+    selected_user uuid;
+    selected_code text;
+begin
+    select u.id into selected_user
+    from auth.users u
+    where lower(u.email) = lower(trim(p_email));
+
+    if selected_user is null then
+        raise exception 'No existe un usuario Auth con ese correo';
+    end if;
+
+    update public.profiles
+    set role = 'nutritionist', patient_id = null
+    where id = selected_user
+    returning invite_code into selected_code;
+
+    return selected_code;
+end;
+$$;
+
+-- Función administrativa opcional para asociar datos heredados V0.2.
+create or replace function public.attach_legacy_patient(
+    p_email text,
+    p_patient_id uuid
+)
+returns void
+language plpgsql
+security definer set search_path = ''
+as $$
+declare
+    selected_user uuid;
+begin
+    select u.id into selected_user
+    from auth.users u
+    where lower(u.email) = lower(trim(p_email));
+    if selected_user is null then
+        raise exception 'No existe un usuario Auth con ese correo';
+    end if;
+    if not exists (select 1 from public.patients p where p.id = p_patient_id) then
+        raise exception 'No existe el paciente heredado';
+    end if;
+    update public.profiles
+    set role = 'patient', patient_id = p_patient_id
+    where id = selected_user;
+end;
+$$;
+
+-- Permisos mínimos para la API autenticada.
+revoke all on schema private from public;
+grant usage on schema private to authenticated;
+revoke all on all functions in schema private from public;
+grant execute on function private.current_patient_id() to authenticated;
+grant execute on function private.is_nutritionist() to authenticated;
+grant execute on function private.can_access_patient(uuid) to authenticated;
+grant execute on function private.can_manage_goals(uuid) to authenticated;
+grant execute on function private.can_view_profile(uuid) to authenticated;
+
+revoke all on function public.link_my_nutritionist(text) from public;
+grant execute on function public.link_my_nutritionist(text) to authenticated;
+revoke all on function public.promote_user_to_nutritionist(text) from public, anon, authenticated;
+revoke all on function public.attach_legacy_patient(text, uuid) from public, anon, authenticated;
+
+grant usage on schema public to authenticated;
+grant select on public.profiles to authenticated;
+grant select, update on public.patients to authenticated;
+grant select, insert, update on public.goals to authenticated;
+grant select, insert, update, delete on public.food_log to authenticated;
+grant select on public.nutritionist_patients to authenticated;
+grant usage, select on all sequences in schema public to authenticated;
+
+alter table public.profiles enable row level security;
 alter table public.patients enable row level security;
 alter table public.goals enable row level security;
 alter table public.food_log enable row level security;
+alter table public.nutritionist_patients enable row level security;
 
--- Acceso explícito para el rol de backend. Las Secret keys nuevas y la
--- service_role legacy operan con este rol y bypassan RLS.
-grant usage on schema public to service_role;
-grant all on table public.patients to service_role;
-grant all on table public.goals to service_role;
-grant all on table public.food_log to service_role;
-grant usage, select on all sequences in schema public to service_role;
+drop policy if exists "profiles_select_allowed" on public.profiles;
+create policy "profiles_select_allowed"
+on public.profiles for select to authenticated
+using ((select private.can_view_profile(id)));
 
--- Registro inicial del MVP. La app también puede recrearlo si se borra.
-insert into public.patients (id, name, age, sex, weight, height)
-values (
-    '11111111-1111-1111-1111-111111111111',
-    'Paciente demo',
-    30,
-    'Femenino',
-    65,
-    165
-)
-on conflict (id) do nothing;
+drop policy if exists "patients_select_allowed" on public.patients;
+create policy "patients_select_allowed"
+on public.patients for select to authenticated
+using ((select private.can_access_patient(id)));
 
-insert into public.goals (
-    patient_id, calories, protein, carbs, fat, fiber, water
-)
-values (
-    '11111111-1111-1111-1111-111111111111',
-    2000, 120, 220, 65, 30, 2500
-)
-on conflict (patient_id) do nothing;
+drop policy if exists "patients_update_allowed" on public.patients;
+create policy "patients_update_allowed"
+on public.patients for update to authenticated
+using ((select private.can_access_patient(id)))
+with check ((select private.can_access_patient(id)));
+
+drop policy if exists "goals_select_allowed" on public.goals;
+create policy "goals_select_allowed"
+on public.goals for select to authenticated
+using ((select private.can_access_patient(patient_id)));
+
+drop policy if exists "goals_insert_allowed" on public.goals;
+create policy "goals_insert_allowed"
+on public.goals for insert to authenticated
+with check ((select private.can_manage_goals(patient_id)));
+
+drop policy if exists "goals_update_allowed" on public.goals;
+create policy "goals_update_allowed"
+on public.goals for update to authenticated
+using ((select private.can_manage_goals(patient_id)))
+with check ((select private.can_manage_goals(patient_id)));
+
+drop policy if exists "food_log_select_allowed" on public.food_log;
+create policy "food_log_select_allowed"
+on public.food_log for select to authenticated
+using ((select private.can_access_patient(patient_id)));
+
+drop policy if exists "food_log_insert_own" on public.food_log;
+create policy "food_log_insert_own"
+on public.food_log for insert to authenticated
+with check (patient_id = (select private.current_patient_id()));
+
+drop policy if exists "food_log_update_own" on public.food_log;
+create policy "food_log_update_own"
+on public.food_log for update to authenticated
+using (patient_id = (select private.current_patient_id()))
+with check (patient_id = (select private.current_patient_id()));
+
+drop policy if exists "food_log_delete_own" on public.food_log;
+create policy "food_log_delete_own"
+on public.food_log for delete to authenticated
+using (patient_id = (select private.current_patient_id()));
+
+drop policy if exists "links_select_participant" on public.nutritionist_patients;
+create policy "links_select_participant"
+on public.nutritionist_patients for select to authenticated
+using (
+    nutritionist_id = (select auth.uid())
+    or patient_id = (select private.current_patient_id())
+);
