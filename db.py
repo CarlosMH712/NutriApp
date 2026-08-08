@@ -562,7 +562,7 @@ def get_history(patient_id: str) -> pd.DataFrame:
     while True:
         response = (
             db.table("food_log")
-            .select("log_date,calories,protein,carbs,fat,fiber,water")
+            .select("log_date,food,quantity,unit,calories,protein,carbs,fat,fiber,water")
             .eq("patient_id", patient_id)
             .order("log_date")
             .range(start, start + page_size - 1)
@@ -576,6 +576,9 @@ def get_history(patient_id: str) -> pd.DataFrame:
 
     columns = [
         "log_date",
+        "food",
+        "quantity",
+        "unit",
         "calories",
         "protein",
         "carbs",

@@ -41,6 +41,15 @@ from food_sources import (
     food_data_central_configured,
     search_food_data_central,
 )
+from food_measurements import (
+    GRAMS,
+    MILLILITERS,
+    calculate_food_serving,
+    effective_water_ml,
+    is_plain_water_name,
+    measurement_options,
+    volume_ml_from_quantity,
+)
 from nutrition_calculations import (
     ACTIVITY_FACTORS,
     calculate_bmi,
@@ -176,7 +185,19 @@ def totals_for_day(df: pd.DataFrame) -> dict[str, float]:
     keys = ["calories", "protein", "carbs", "fat", "fiber", "water"]
     if df.empty:
         return {key: 0.0 for key in keys}
-    return {key: float(df[key].fillna(0).sum()) for key in keys}
+    totals = {key: float(df[key].fillna(0).sum()) for key in keys}
+    totals["water"] = float(
+        df.apply(
+            lambda row: effective_water_ml(
+                row.get("food"),
+                float(row.get("quantity") or 0),
+                row.get("unit"),
+                float(row.get("water") or 0),
+            ),
+            axis=1,
+        ).sum()
+    )
+    return totals
 
 
 def _scaled_food_values(row: pd.Series, quantity: float) -> dict[str, float]:
@@ -377,12 +398,25 @@ def render_day(
                 columns = st.columns(widths)
                 with columns[0]:
                     st.write(f"**{row['food']}**")
+                    row_water = effective_water_ml(
+                        row.get("food"), row.get("quantity", 0),
+                        row.get("unit"), row.get("water", 0),
+                    )
+                    water_detail = (
+                        f" · Agua {row_water:.0f} ml"
+                        if row_water > 0 and (
+                            is_plain_water_name(row.get("food"))
+                            or str(row.get("unit") or "").lower() == "ml"
+                        )
+                        else ""
+                    )
                     st.caption(
                         f"{row['quantity']} {row['unit']} · "
                         f"P {float(row['protein']):.1f} g · "
                         f"CHO {float(row['carbs']):.1f} g · "
                         f"G {float(row['fat']):.1f} g · "
                         f"Fibra {float(row['fiber']):.1f} g"
+                        f"{water_detail}"
                     )
                     if pd.notna(row.get("source_name")) and row.get("source_name"):
                         st.caption(f"Fuente: {row['source_name']}")
@@ -475,12 +509,13 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
         f"G {float(selected_food['fat_per_100g']):.1f} g"
     )
 
-    unit_options = ["gramos"]
+    unit_options = measurement_options(selected_food)
     portion_name = str(selected_food.get("portion_name") or "").strip()
     portion_grams = float(selected_food.get("portion_grams") or 0)
     if portion_name and portion_grams > 0:
-        unit_options.append(portion_name)
         st.caption(f"Medida casera disponible: 1 {portion_name} = {portion_grams:.1f} g")
+    if MILLILITERS in unit_options:
+        st.caption("Para líquidos, la conversión nutrimental aproxima 1 ml = 1 g.")
 
     selection_key = str(selected_food["result_key"]).replace(":", "_")
     unit_choice = st.selectbox(
@@ -488,24 +523,18 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
         unit_options,
         key=f"catalog_unit_{selection_key}",
     )
-    default_quantity = 100.0 if unit_choice == "gramos" else 1.0
+    default_quantity = 250.0 if unit_choice == MILLILITERS else (
+        100.0 if unit_choice == GRAMS else 1.0
+    )
     amount = st.number_input(
         f"Cantidad consumida ({unit_choice})",
         min_value=0.01,
         value=default_quantity,
-        step=1.0 if unit_choice == "gramos" else 0.25,
+        step=1.0 if unit_choice in {GRAMS, MILLILITERS} else 0.25,
         key=f"catalog_amount_{selection_key}_{unit_choice}",
     )
-    grams = float(amount) if unit_choice == "gramos" else float(amount) * portion_grams
-    factor = grams / 100.0
-    calculated = {
-        "calories": float(selected_food["calories_per_100g"]) * factor,
-        "protein": float(selected_food["protein_per_100g"]) * factor,
-        "carbs": float(selected_food["carbs_per_100g"]) * factor,
-        "fat": float(selected_food["fat_per_100g"]) * factor,
-        "fiber": float(selected_food["fiber_per_100g"]) * factor,
-        "water": float(selected_food["water_per_100g"]) * factor,
-    }
+    calculated = calculate_food_serving(selected_food, amount, unit_choice)
+    grams = float(calculated["grams"])
 
     st.write(f"**Cálculo para {grams:.1f} g**")
     c1, c2, c3, c4 = st.columns(4)
@@ -527,7 +556,7 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
                 meal,
                 str(selected_food["name"]),
                 float(amount),
-                "g" if unit_choice == "gramos" else unit_choice,
+                calculated["unit"],
                 calculated["calories"],
                 calculated["protein"],
                 calculated["carbs"],
@@ -553,7 +582,11 @@ def render_manual_register(patient_id: str, selected_date: date) -> None:
             meal = st.selectbox("Tiempo de comida", ["Desayuno", "Comida", "Cena", "Snack"], key="manual_meal")
             food = st.text_input("Alimento", placeholder="Ej. Huevo", key="manual_food")
             quantity = st.number_input("Cantidad", min_value=0.0, value=1.0, step=0.5, key="manual_quantity")
-            unit = st.selectbox("Unidad", ["pieza", "g", "ml", "taza", "cucharada", "porción"], key="manual_unit")
+            unit = st.selectbox(
+                "Unidad",
+                ["pieza", "g", "ml", "litro", "taza", "vaso", "cucharada", "porción"],
+                key="manual_unit",
+            )
         with col2:
             calories = st.number_input("Calorías (kcal)", min_value=0.0, step=10.0, key="manual_calories")
             protein = st.number_input("Proteína (g)", min_value=0.0, step=1.0, key="manual_protein")
@@ -568,6 +601,13 @@ def render_manual_register(patient_id: str, selected_date: date) -> None:
             st.error("Escribe el nombre del alimento.")
         else:
             try:
+                effective_water = float(water)
+                if effective_water == 0 and is_plain_water_name(food):
+                    inferred_water = volume_ml_from_quantity(quantity, unit)
+                    if inferred_water is not None:
+                        effective_water = inferred_water
+                    elif unit == "g":
+                        effective_water = float(quantity)
                 save_food(
                     patient_id,
                     selected_date,
@@ -580,7 +620,7 @@ def render_manual_register(patient_id: str, selected_date: date) -> None:
                     carbs,
                     fat,
                     fiber,
-                    water,
+                    effective_water,
                     source_name="Registro manual",
                 )
                 st.success(f"{food.strip()} registrado correctamente.")
@@ -633,6 +673,12 @@ def render_history(patient_id: str) -> None:
                 raw_history[col] = pd.to_numeric(
                     raw_history[col], errors="coerce"
                 ).fillna(0)
+            raw_history["water"] = raw_history.apply(
+                lambda row: effective_water_ml(
+                    row.get("food"), row.get("quantity", 0), row.get("unit"), row["water"]
+                ),
+                axis=1,
+            )
             df_history = (
                 raw_history.groupby("log_date", as_index=False)[numeric_cols]
                 .sum()
