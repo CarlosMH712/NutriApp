@@ -1,53 +1,101 @@
-# 🥗 Mi Nutrición — Streamlit MVP
+# 🥗 Mi Nutrición — V0.2 con Supabase
 
-Primera versión de una app de seguimiento nutricional desarrollada con Streamlit.
+Esta versión reemplaza SQLite por **Supabase/PostgreSQL**, por lo que los registros pueden persistir aunque Streamlit Community Cloud reinicie o vuelva a desplegar la app.
 
-## Funciones incluidas
+También incorpora un **PIN básico de acceso** almacenado en Streamlit Secrets. El PIN sirve únicamente para proteger el MVP de accesos casuales; no sustituye una autenticación individual para pacientes.
 
-- Perfil básico del paciente.
-- Metas nutricionales editables por la nutrióloga.
-- Registro de desayuno, comida, cena y snacks.
-- Seguimiento de:
-  - kcal
-  - proteína
-  - carbohidratos
-  - grasas
-  - fibra
-  - agua
-- Dashboard diario.
-- Historial y resumen de los últimos 7 días.
-- Persistencia local mediante SQLite.
-- Estructura sencilla para seguir incorporando:
-  - múltiples pacientes
-  - base de alimentos
-  - equivalentes
-  - recetas
-  - IA
-  - Supabase/PostgreSQL
+## Qué cambió respecto a V0.1
+
+- Persistencia real en Supabase/PostgreSQL.
+- SQLite eliminado del flujo de ejecución.
+- Esquema SQL versionado en `supabase_schema.sql`.
+- Credenciales leídas con `st.secrets`.
+- PIN de acceso al MVP.
+- Row Level Security habilitado sin políticas públicas.
+- Uso de una Supabase **Secret key (`sb_secret_...`)** solamente desde el servidor de Streamlit; también se admite `service_role` legacy como fallback.
+- Estructura preparada para añadir múltiples pacientes y autenticación en la siguiente fase.
 
 ## Estructura
 
 ```text
-nutrition_streamlit_mvp/
+nutrition_streamlit_supabase/
 ├── .streamlit/
-│   └── config.toml
+│   ├── config.toml
+│   └── secrets.toml.example
 ├── app.py
+├── db.py
+├── supabase_schema.sql
 ├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
 
-La carpeta `data/` se crea automáticamente al ejecutar la app y no se sube a GitHub.
+## 1. Crear un proyecto en Supabase
 
-## Ejecutar localmente
+1. Crea un proyecto nuevo en Supabase.
+2. Espera a que termine de inicializarse.
+3. En el panel del proyecto abre **SQL Editor**.
+4. Crea una consulta nueva.
+5. Copia todo el contenido de `supabase_schema.sql`.
+6. Ejecuta el script.
 
-### 1. Crear entorno virtual
+El script crea:
 
-macOS / Linux:
+- `patients`
+- `goals`
+- `food_log`
+- índice por paciente/fecha
+- un paciente demo
+- metas demo
+- RLS en las tres tablas
+
+## 2. Obtener las credenciales
+
+En Supabase abre la configuración/API del proyecto y localiza:
+
+- Project URL
+- Secret key (`sb_secret_...`) recomendada por Supabase para backend
+
+Si tu proyecto solo tiene claves legacy, también funciona con `service_role`, aunque Supabase está migrando a las Secret keys nuevas.
+
+> **Importante:** la Secret key es una credencial privilegiada que bypassa RLS. Debe permanecer exclusivamente en Streamlit Secrets y nunca debe aparecer en GitHub, capturas, código frontend o archivos públicos.
+
+## 3. Configuración local
+
+Copia:
+
+```text
+.streamlit/secrets.toml.example
+```
+
+como:
+
+```text
+.streamlit/secrets.toml
+```
+
+Completa:
+
+```toml
+[app]
+pin = "UN_PIN_PRIVADO"
+
+[supabase]
+url = "https://TU-PROYECTO.supabase.co"
+secret_key = "sb_secret_TU_CLAVE_SECRETA"
+```
+
+`secrets.toml` está incluido en `.gitignore` y no debe subirse al repositorio.
+
+## 4. Ejecutar localmente
+
+macOS/Linux:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
 ```
 
 Windows:
@@ -55,96 +103,75 @@ Windows:
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
-```
-
-### 2. Instalar dependencias
-
-```bash
 pip install -r requirements.txt
-```
-
-### 3. Ejecutar
-
-```bash
 streamlit run app.py
 ```
 
-## Subir a GitHub
+## 5. Subir la nueva versión a GitHub
 
-Desde esta carpeta:
+Si vas a reemplazar la versión anterior, copia estos archivos sobre tu repositorio y ejecuta:
 
 ```bash
-git init
 git add .
-git commit -m "Initial nutrition Streamlit MVP"
-git branch -M main
-git remote add origin URL_DE_TU_REPOSITORIO
-git push -u origin main
+git commit -m "Migrate nutrition app persistence to Supabase"
+git push
 ```
 
-También puedes copiar directamente esta carpeta dentro de un repositorio que ya tengas.
+Streamlit Community Cloud normalmente detectará el push y volverá a desplegar la app.
 
-## Desplegar en Streamlit Community Cloud
+## 6. Configurar Secrets en Streamlit Community Cloud
 
-1. Sube el repositorio a GitHub.
-2. Entra a Streamlit Community Cloud.
-3. Selecciona **Create app**.
-4. Conecta el repositorio.
-5. Selecciona:
-   - Branch: `main`
-   - Main file path: `app.py`
-6. Despliega la aplicación.
+En la configuración de la app desplegada abre **Secrets** y pega:
 
-## ⚠️ Persistencia en Streamlit Community Cloud
+```toml
+[app]
+pin = "UN_PIN_PRIVADO"
 
-Esta primera versión usa SQLite para que sea muy fácil probarla localmente.
+[supabase]
+url = "https://TU-PROYECTO.supabase.co"
+secret_key = "sb_secret_TU_CLAVE_SECRETA"
+```
 
-En Streamlit Community Cloud, el sistema de archivos de la instancia no debe considerarse una base de datos persistente. Los datos pueden perderse cuando la aplicación se reinicia, se actualiza o se vuelve a desplegar.
+Guarda los cambios y reinicia/redeploya la app si fuera necesario.
 
-Por ello:
+## 7. Prueba recomendada
 
-- Esta versión es adecuada como **MVP y demostración**.
-- No debe usarse todavía para almacenar expedientes reales de pacientes.
-- La siguiente versión debería migrar la persistencia a **Supabase/PostgreSQL** antes de utilizarse con pacientes.
+1. Entra con el PIN.
+2. Cambia el nombre o una meta nutricional.
+3. Registra un alimento.
+4. Cambia de fecha y vuelve.
+5. Reinicia la app desde Streamlit Cloud.
+6. Comprueba que los datos sigan presentes.
+7. Revisa también las tablas desde Supabase > Table Editor.
 
-## Privacidad
+## Seguridad del MVP
 
-No subas a GitHub:
+Esta versión mejora significativamente la persistencia, pero todavía **no debe considerarse un sistema clínico multiusuario**.
 
-- archivos `.db`
-- información identificable de pacientes
-- API keys
-- contraseñas
-- `secrets.toml`
+Actualmente:
 
-El `.gitignore` incluido ya bloquea las ubicaciones más comunes.
+- existe un solo paciente demo;
+- todas las personas que conozcan el PIN acceden al mismo perfil;
+- el servidor de Streamlit utiliza una Secret key privilegiada (o `service_role` legacy como fallback);
+- RLS está habilitado y no hay políticas públicas, por lo que las tablas no quedan abiertas mediante una anon/publishable key.
 
-## Próximos pasos sugeridos
+Antes de utilizar expedientes reales de varios pacientes, la siguiente versión debe incorporar:
 
-### V0.2
-- Catálogo de alimentos.
-- Alimentos frecuentes.
-- Recetas.
-- Edición de registros.
-- Mejor dashboard semanal.
+- Supabase Auth;
+- usuarios individuales;
+- roles `nutrióloga` / `paciente`;
+- RLS por usuario;
+- trazabilidad de quién puede leer/modificar cada expediente;
+- política de privacidad y manejo adecuado de datos personales.
 
-### V0.3
+## Próxima etapa sugerida: V0.3
+
 - Múltiples pacientes.
-- Login.
-- Panel de nutrióloga.
-- Plan vs. consumo real.
-- Sistema de equivalentes.
+- Panel de la nutrióloga.
+- Login real con Supabase Auth.
+- Roles y permisos.
+- Selección de paciente.
+- Metas individuales.
+- Resumen de adherencia de cada paciente.
 
-### V0.4
-- Supabase/PostgreSQL.
-- Roles y autenticación.
-- Persistencia real en la nube.
-
-### V0.5
-- IA para interpretar lenguaje natural.
-- Confirmación antes de registrar.
-- Integración con una fuente nutricional verificable.
-
----
-
-**Importante:** esta aplicación es una herramienta de seguimiento y no sustituye la valoración ni el criterio profesional de una nutrióloga.
+Después de eso tiene mucho más sentido integrar catálogo de alimentos, equivalentes e IA.
