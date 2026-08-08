@@ -20,7 +20,7 @@ from food_sources import (
     food_data_central_configured,
     search_food_data_central,
 )
-from meal_ai import MealAIConfigError, MealAIError, interpret_meal, openai_configured
+from meal_ai import MealAIConfigError, MealAIError, gemini_configured, interpret_meal
 
 
 MEALS = ["Desayuno", "Comida", "Cena", "Snack"]
@@ -174,14 +174,15 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
         "componentes, pero los nutrientes siempre se obtienen del catálogo."
     )
     st.caption(
-        "Al presionar Interpretar, se envía únicamente esta descripción a OpenAI. "
-        "Evita escribir nombres, diagnósticos u otros datos personales."
+        "Al presionar Interpretar, se envía únicamente esta descripción a Gemini. "
+        "Evita escribir nombres, diagnósticos u otros datos personales. El nivel "
+        "gratuito de Gemini puede usar el contenido para mejorar productos de Google."
     )
     if notice := st.session_state.pop("ai_saved_notice", None):
         st.success(str(notice))
-    if not openai_configured():
+    if not gemini_configured():
         st.info(
-            "Para activar esta función agrega la clave de OpenAI en los Secrets. "
+            "Para activar esta función agrega la clave de Gemini en los Secrets. "
             "Mientras tanto puedes seguir usando el catálogo y el registro manual."
         )
 
@@ -201,10 +202,7 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
     if interpret_submitted:
         try:
             with st.spinner("Separando ingredientes y buscando equivalencias..."):
-                parsed = interpret_meal(
-                    description,
-                    str(st.session_state.get("auth_user_id") or patient_id),
-                )
+                parsed = interpret_meal(description)
                 parsed_data = parsed.model_dump()
                 for item in parsed_data["items"]:
                     item["matches"] = _catalog_candidates(item["name"])

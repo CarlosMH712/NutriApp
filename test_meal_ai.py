@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from meal_ai import ParsedFood, ParsedMeal, interpret_meal, privacy_safe_identifier
+from meal_ai import ParsedFood, ParsedMeal, interpret_meal
 from meal_workflows import calculate_component, rank_catalog_matches
 
 
@@ -38,7 +38,7 @@ class MealAITests(unittest.TestCase):
         self.assertEqual(result["calories"], 130)
         self.assertEqual(result["carbs"], 25)
 
-    def test_interpretation_uses_structured_output_and_private_identifier(self) -> None:
+    def test_interpretation_uses_gemini_structured_output_without_identity(self) -> None:
         parsed = ParsedMeal(
             dish_name="Hamburguesa sencilla",
             suggested_meal="Comida",
@@ -56,24 +56,27 @@ class MealAITests(unittest.TestCase):
             ],
             missing_details=["¿La hamburguesa tenía queso o aderezo?"],
         )
-        parse_mock = MagicMock(return_value=SimpleNamespace(output_parsed=parsed))
-        fake_client = SimpleNamespace(
-            responses=SimpleNamespace(parse=parse_mock)
+        create_mock = MagicMock(
+            return_value=SimpleNamespace(output_text=parsed.model_dump_json())
         )
-        with patch("meal_ai._config", return_value=("test-key", "gpt-4o-mini")):
-            with patch("meal_ai.OpenAI", return_value=fake_client):
-                result = interpret_meal(
-                    "Comí una hamburguesa", "patient-private-id"
-                )
+        fake_client = SimpleNamespace(
+            interactions=SimpleNamespace(create=create_mock)
+        )
+        with patch(
+            "meal_ai._config",
+            return_value=("test-key", "gemini-3.5-flash-lite"),
+        ):
+            with patch("meal_ai.genai.Client", return_value=fake_client):
+                result = interpret_meal("Comí una hamburguesa")
 
         self.assertEqual(result.dish_name, "Hamburguesa sencilla")
-        kwargs = parse_mock.call_args.kwargs
+        kwargs = create_mock.call_args.kwargs
         self.assertFalse(kwargs["store"])
-        self.assertNotIn("patient-private-id", kwargs["safety_identifier"])
+        self.assertEqual(kwargs["model"], "gemini-3.5-flash-lite")
         self.assertEqual(
-            kwargs["safety_identifier"],
-            privacy_safe_identifier("patient-private-id"),
+            kwargs["response_format"]["mime_type"], "application/json"
         )
+        self.assertNotIn("patient-private-id", kwargs["input"])
 
 
 if __name__ == "__main__":

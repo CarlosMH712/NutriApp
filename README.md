@@ -1,4 +1,4 @@
-# 🥗 Mi Nutrición — V0.7 registro inteligente y recetas
+# 🥗 Mi Nutrición — V0.8 registro inteligente con Gemini
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
@@ -73,12 +73,12 @@ Para habilitar la búsqueda de alimentos de USDA, solicita una API key en `https
 api_key = "TU_API_KEY"
 ```
 
-Para habilitar la interpretación de platillos agrega una clave de proyecto de OpenAI:
+Para habilitar la interpretación de platillos crea una clave en Google AI Studio y agrega:
 
 ```toml
-[openai]
-api_key = "TU_OPENAI_API_KEY"
-model = "gpt-4o-mini"
+[gemini]
+api_key = "TU_GEMINI_API_KEY"
+model = "gemini-3.5-flash-lite"
 ```
 
 Pega esta configuración en:
@@ -89,8 +89,10 @@ Pega esta configuración en:
 `secrets.toml` está excluido por `.gitignore` y nunca debe subirse a GitHub.
 
 La descripción de la comida se envía a la API sólo cuando el usuario presiona
-**Interpretar platillo**. No se envía nombre, correo ni expediente; la solicitud usa
-`store=False` y un identificador irreversible derivado del usuario para controles de abuso.
+**Interpretar platillo**. No se envía nombre, correo, identificador de usuario ni
+expediente; la solicitud usa `store=False`. En el nivel gratuito, Google indica que
+el contenido puede utilizarse para mejorar sus productos. Por eso la interfaz pide
+no escribir nombres, diagnósticos ni otros datos personales.
 
 ## 4. Crear la cuenta del nutriólogo
 
@@ -185,7 +187,7 @@ python3 -m streamlit run app.py
 
 ## 11. Desplegar
 
-Sube el código a GitHub sin `secrets.toml`. Streamlit Community Cloud actualizará la app desde el repositorio. Después verifica que **App settings > Secrets** incluya la configuración de Supabase y, opcionalmente, FoodData Central.
+Sube el código a GitHub sin `secrets.toml`. Streamlit Community Cloud actualizará la app desde el repositorio. Después verifica que **App settings > Secrets** incluya la configuración de Supabase, Gemini y, opcionalmente, FoodData Central.
 
 ## Pruebas recomendadas
 
