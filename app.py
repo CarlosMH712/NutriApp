@@ -13,6 +13,7 @@ from db import (
     delete_catalog_food,
     delete_food,
     get_auth_context,
+    get_body_measurements,
     get_day_log,
     get_goals,
     get_history,
@@ -23,6 +24,7 @@ from db import (
     list_owned_catalog,
     patient_has_nutritionist,
     save_food,
+    save_body_measurement,
     search_catalog,
     sign_in,
     sign_out,
@@ -34,6 +36,12 @@ from food_sources import (
     FoodSourceError,
     food_data_central_configured,
     search_food_data_central,
+)
+from nutrition_calculations import (
+    ACTIVITY_FACTORS,
+    calculate_bmi,
+    calculate_nutrition_targets,
+    mifflin_st_jeor,
 )
 
 
@@ -296,6 +304,7 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
     portion_grams = float(selected_food.get("portion_grams") or 0)
     if portion_name and portion_grams > 0:
         unit_options.append(portion_name)
+        st.caption(f"Medida casera disponible: 1 {portion_name} = {portion_grams:.1f} g")
 
     selection_key = str(selected_food["result_key"]).replace(":", "_")
     unit_choice = st.selectbox(
@@ -305,10 +314,10 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
     )
     default_quantity = 100.0 if unit_choice == "gramos" else 1.0
     amount = st.number_input(
-        "Cantidad consumida",
+        f"Cantidad consumida ({unit_choice})",
         min_value=0.01,
         value=default_quantity,
-        step=1.0 if unit_choice == "gramos" else 0.5,
+        step=1.0 if unit_choice == "gramos" else 0.25,
         key=f"catalog_amount_{selection_key}_{unit_choice}",
     )
     grams = float(amount) if unit_choice == "gramos" else float(amount) * portion_grams
@@ -473,7 +482,16 @@ def render_profile_and_goals(
     can_edit_goals: bool,
 ) -> None:
     st.title("👤 Perfil y metas")
-    tab1, tab2 = st.tabs(["Perfil", "Metas nutricionales"])
+    try:
+        measurements = get_body_measurements(patient_id)
+        measurements_error: Exception | None = None
+    except Exception as exc:
+        measurements = pd.DataFrame()
+        measurements_error = exc
+
+    tab1, tab2, tab3 = st.tabs(
+        ["Perfil", "Metas nutricionales", "Composición corporal"]
+    )
     with tab1:
         st.subheader("Datos del paciente")
         if not can_edit_profile:
@@ -488,10 +506,18 @@ def render_profile_and_goals(
                 sex = st.selectbox("Sexo", sex_options, index=sex_index)
                 weight = st.number_input("Peso (kg)", min_value=1.0, value=float(profile.get("weight") or 70), step=0.1)
                 height = st.number_input("Estatura (cm)", min_value=50.0, value=float(profile.get("height") or 165), step=0.5)
+                activity_options = list(ACTIVITY_FACTORS)
+                current_activity = str(profile.get("activity_level") or "Sedentaria")
+                activity_index = activity_options.index(current_activity) if current_activity in activity_options else 0
+                activity_level = st.selectbox(
+                    "Nivel de actividad habitual", activity_options, index=activity_index
+                )
                 save_profile = st.form_submit_button("Guardar perfil", use_container_width=True)
             if save_profile:
                 try:
-                    update_profile(patient_id, name, age, sex, weight, height)
+                    update_profile(
+                        patient_id, name, age, sex, weight, height, activity_level
+                    )
                     st.success("Perfil actualizado.")
                     st.rerun()
                 except Exception as exc:
@@ -502,22 +528,240 @@ def render_profile_and_goals(
         st.subheader("Metas nutricionales")
         if not can_edit_goals:
             st.info("Estas metas fueron establecidas por tu nutriólogo.")
+
+        def saved_number(field: str, default: float) -> float:
+            value = goals.get(field)
+            return float(default) if value is None else float(value)
+
+        latest_basal = None
+        if not measurements.empty and "basal_calories" in measurements:
+            basal_values = pd.to_numeric(
+                measurements["basal_calories"], errors="coerce"
+            ).dropna()
+            if not basal_values.empty:
+                latest_basal = float(basal_values.iloc[0])
+
+        with st.expander("🧮 Calculadora automática", expanded=True):
+            st.caption(
+                "Estimación inicial para adultos. El resultado siempre queda editable "
+                "y debe ser validado por el profesional de nutrición."
+            )
+            method_options = ["Mifflin-St Jeor"]
+            if latest_basal and latest_basal > 0:
+                method_options.append("Calorías basales del equipo")
+            saved_method = str(goals.get("calculation_method") or method_options[0])
+            method_index = method_options.index(saved_method) if saved_method in method_options else 0
+            calculation_method = st.selectbox(
+                "Método para gasto en reposo", method_options, index=method_index,
+                disabled=not can_edit_goals,
+            )
+
+            calc_col1, calc_col2, calc_col3 = st.columns(3)
+            default_activity = saved_number(
+                "activity_factor",
+                ACTIVITY_FACTORS.get(
+                    str(profile.get("activity_level") or "Sedentaria"), 1.2
+                ),
+            )
+            with calc_col1:
+                activity_factor = st.number_input(
+                    "Factor de actividad", min_value=1.0, max_value=2.5,
+                    value=default_activity, step=0.025, disabled=not can_edit_goals,
+                )
+            with calc_col2:
+                calorie_adjustment = st.number_input(
+                    "Ajuste sobre mantenimiento (%)", min_value=-50.0, max_value=50.0,
+                    value=saved_number("calorie_adjustment_pct", 0), step=5.0,
+                    disabled=not can_edit_goals,
+                )
+            with calc_col3:
+                water_ml_per_kg = st.number_input(
+                    "Agua orientativa (ml/kg)", min_value=0.0, max_value=100.0,
+                    value=saved_number("water_ml_per_kg", 35), step=1.0,
+                    disabled=not can_edit_goals,
+                )
+
+            macro_col1, macro_col2, macro_col3 = st.columns(3)
+            with macro_col1:
+                protein_pct = st.number_input(
+                    "Proteína (%)", min_value=0.0, max_value=100.0,
+                    value=saved_number("protein_pct", 25), step=1.0,
+                    disabled=not can_edit_goals,
+                )
+            with macro_col2:
+                carbs_pct = st.number_input(
+                    "Carbohidratos (%)", min_value=0.0, max_value=100.0,
+                    value=saved_number("carbs_pct", 45), step=1.0,
+                    disabled=not can_edit_goals,
+                )
+            with macro_col3:
+                fat_pct = st.number_input(
+                    "Grasas (%)", min_value=0.0, max_value=100.0,
+                    value=saved_number("fat_pct", 30), step=1.0,
+                    disabled=not can_edit_goals,
+                )
+
+            calculation_error = None
+            calculated_targets = None
+            try:
+                if calculation_method == "Calorías basales del equipo":
+                    resting_calories = float(latest_basal or 0)
+                else:
+                    resting_calories = mifflin_st_jeor(
+                        float(profile.get("weight") or 0),
+                        float(profile.get("height") or 0),
+                        int(profile.get("age") or 0),
+                        str(profile.get("sex") or ""),
+                    )
+                calculated_targets = calculate_nutrition_targets(
+                    resting_calories=resting_calories,
+                    weight_kg=float(profile.get("weight") or 0),
+                    activity_factor=activity_factor,
+                    calorie_adjustment_pct=calorie_adjustment,
+                    protein_pct=protein_pct,
+                    carbs_pct=carbs_pct,
+                    fat_pct=fat_pct,
+                    water_ml_per_kg=water_ml_per_kg,
+                )
+            except ValueError as exc:
+                calculation_error = str(exc)
+
+            if calculation_error:
+                st.warning(calculation_error)
+            elif calculated_targets:
+                metric1, metric2, metric3 = st.columns(3)
+                metric1.metric("Gasto en reposo", f"{calculated_targets['resting_calories']:.0f} kcal")
+                metric2.metric("Mantenimiento estimado", f"{calculated_targets['maintenance_calories']:.0f} kcal")
+                metric3.metric("Meta calculada", f"{calculated_targets['calories']:.0f} kcal")
+
+            apply_calculation = st.button(
+                "Aplicar cálculo a las metas",
+                use_container_width=True,
+                disabled=not can_edit_goals or calculated_targets is None,
+            )
+            if apply_calculation and calculated_targets:
+                goal_prefix = f"goal_{patient_id}"
+                for field in ["calories", "protein", "carbs", "fat", "fiber", "water"]:
+                    st.session_state[f"{goal_prefix}_{field}"] = float(calculated_targets[field])
+                st.session_state[f"{goal_prefix}_calculation"] = {
+                    "calculation_method": calculation_method,
+                    "resting_calories": resting_calories,
+                    "activity_factor": activity_factor,
+                    "calorie_adjustment_pct": calorie_adjustment,
+                    "protein_pct": protein_pct,
+                    "carbs_pct": carbs_pct,
+                    "fat_pct": fat_pct,
+                    "water_ml_per_kg": water_ml_per_kg,
+                }
+                st.rerun()
+
+        goal_prefix = f"goal_{patient_id}"
+        for field in ["calories", "protein", "carbs", "fat", "fiber", "water"]:
+            st.session_state.setdefault(f"{goal_prefix}_{field}", float(goals[field]))
         with st.form("goals_form"):
-            goal_calories = st.number_input("Energía (kcal/día)", min_value=0.0, value=float(goals["calories"]), step=50.0, disabled=not can_edit_goals)
-            goal_protein = st.number_input("Proteína (g/día)", min_value=0.0, value=float(goals["protein"]), step=5.0, disabled=not can_edit_goals)
-            goal_carbs = st.number_input("Carbohidratos (g/día)", min_value=0.0, value=float(goals["carbs"]), step=5.0, disabled=not can_edit_goals)
-            goal_fat = st.number_input("Grasas (g/día)", min_value=0.0, value=float(goals["fat"]), step=5.0, disabled=not can_edit_goals)
-            goal_fiber = st.number_input("Fibra (g/día)", min_value=0.0, value=float(goals["fiber"]), step=1.0, disabled=not can_edit_goals)
-            goal_water = st.number_input("Agua (ml/día)", min_value=0.0, value=float(goals["water"]), step=100.0, disabled=not can_edit_goals)
+            goal_calories = st.number_input("Energía (kcal/día)", min_value=0.0, step=50.0, disabled=not can_edit_goals, key=f"{goal_prefix}_calories")
+            goal_protein = st.number_input("Proteína (g/día)", min_value=0.0, step=5.0, disabled=not can_edit_goals, key=f"{goal_prefix}_protein")
+            goal_carbs = st.number_input("Carbohidratos (g/día)", min_value=0.0, step=5.0, disabled=not can_edit_goals, key=f"{goal_prefix}_carbs")
+            goal_fat = st.number_input("Grasas (g/día)", min_value=0.0, step=5.0, disabled=not can_edit_goals, key=f"{goal_prefix}_fat")
+            goal_fiber = st.number_input("Fibra (g/día)", min_value=0.0, step=1.0, disabled=not can_edit_goals, key=f"{goal_prefix}_fiber")
+            goal_water = st.number_input("Agua (ml/día)", min_value=0.0, step=100.0, disabled=not can_edit_goals, key=f"{goal_prefix}_water")
             save_goals = st.form_submit_button("Guardar metas", use_container_width=True, disabled=not can_edit_goals)
         if save_goals:
             try:
-                update_goals(patient_id, goal_calories, goal_protein, goal_carbs, goal_fat, goal_fiber, goal_water)
+                calculation_metadata = st.session_state.get(
+                    f"{goal_prefix}_calculation",
+                    {
+                        "calculation_method": goals.get("calculation_method"),
+                        "resting_calories": goals.get("resting_calories"),
+                        "activity_factor": goals.get("activity_factor"),
+                        "calorie_adjustment_pct": goals.get("calorie_adjustment_pct"),
+                        "protein_pct": goals.get("protein_pct"),
+                        "carbs_pct": goals.get("carbs_pct"),
+                        "fat_pct": goals.get("fat_pct"),
+                        "water_ml_per_kg": goals.get("water_ml_per_kg"),
+                    },
+                )
+                update_goals(
+                    patient_id, goal_calories, goal_protein, goal_carbs,
+                    goal_fat, goal_fiber, goal_water, **calculation_metadata,
+                )
                 st.success("Metas actualizadas.")
                 st.rerun()
             except Exception as exc:
                 st.error("No se pudieron actualizar las metas.")
                 st.code(str(exc))
+
+    with tab3:
+        st.subheader("Mediciones de composición corporal")
+        try:
+            calculated_bmi = calculate_bmi(
+                float(profile.get("weight") or 0),
+                float(profile.get("height") or 0),
+            )
+            st.metric("IMC calculado con peso y estatura", f"{calculated_bmi:.2f} kg/m²")
+        except ValueError:
+            calculated_bmi = 0.0
+
+        st.caption(
+            "Los valores de Tanita, Omron u otro equipo son opcionales y dependen "
+            "del dispositivo y sus condiciones de medición."
+        )
+        if measurements_error:
+            st.warning(
+                "La tabla de composición corporal aún no está disponible. "
+                "Ejecuta la migración V0.5 en Supabase."
+            )
+            with st.expander("Detalle técnico"):
+                st.code(str(measurements_error))
+        else:
+            with st.form("body_measurement_form", clear_on_submit=True):
+                measured_on = st.date_input("Fecha de medición", value=date.today())
+                device = st.selectbox("Equipo", ["Tanita", "Omron", "Otro", "Sin especificar"])
+                measure_col1, measure_col2 = st.columns(2)
+                with measure_col1:
+                    measured_bmi = st.number_input("IMC del equipo (opcional)", min_value=0.0, value=float(calculated_bmi), step=0.1)
+                    body_fat_pct = st.number_input("Grasa corporal (%)", min_value=0.0, max_value=100.0, step=0.1)
+                    muscle_pct = st.number_input("Músculo (%)", min_value=0.0, max_value=100.0, step=0.1)
+                with measure_col2:
+                    basal_calories = st.number_input("Calorías basales del equipo", min_value=0.0, step=10.0)
+                    visceral_fat = st.number_input("Grasa visceral (nivel)", min_value=0.0, step=0.5)
+                    metabolic_age = st.number_input("Edad metabólica", min_value=0, max_value=150, step=1)
+                measurement_notes = st.text_area("Notas (opcional)")
+                save_measurement = st.form_submit_button("Guardar medición", use_container_width=True)
+            if save_measurement:
+                try:
+                    save_body_measurement(
+                        patient_id, measured_on, device, measured_bmi,
+                        body_fat_pct, muscle_pct, basal_calories,
+                        visceral_fat, metabolic_age, measurement_notes,
+                    )
+                    st.success("Medición guardada.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo guardar la medición.")
+                    st.code(str(exc))
+
+            if measurements.empty:
+                st.info("Todavía no hay mediciones registradas.")
+            else:
+                display_measurements = measurements.copy()
+                display_measurements = display_measurements.rename(
+                    columns={
+                        "measured_on": "Fecha", "device": "Equipo", "bmi": "IMC",
+                        "body_fat_pct": "Grasa (%)", "muscle_pct": "Músculo (%)",
+                        "basal_calories": "Calorías basales", "visceral_fat": "Grasa visceral",
+                        "metabolic_age": "Edad metabólica", "notes": "Notas",
+                    }
+                )
+                visible_columns = [
+                    "Fecha", "Equipo", "IMC", "Grasa (%)", "Músculo (%)",
+                    "Calorías basales", "Grasa visceral", "Edad metabólica", "Notas",
+                ]
+                st.dataframe(
+                    display_measurements[visible_columns],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 
 CATALOG_IMPORT_COLUMNS = [

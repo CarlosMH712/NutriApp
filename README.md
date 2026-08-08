@@ -1,4 +1,4 @@
-# 🥗 Mi Nutrición — V0.4 catálogo de alimentos
+# 🥗 Mi Nutrición — V0.5 medidas caseras y composición corporal
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
@@ -12,20 +12,23 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 - Catálogo privado creado o importado por cada nutriólogo.
 - Búsqueda opcional en USDA FoodData Central.
 - Cálculo automático de macros por gramos o porción casera.
+- Porciones del SMAE expresadas como taza, pieza, cucharada, onza, envase u otra medida disponible.
+- Calculadora editable de gasto en reposo y metas diarias para adultos.
+- Registro histórico opcional de IMC, grasa, músculo, calorías basales, grasa visceral y edad metabólica.
 - Registro manual disponible cuando el alimento no existe en el catálogo.
 - Trazabilidad de la fuente e identificador de cada alimento registrado.
 
 ## 1. Actualizar la base de datos
 
-### Proyecto que ya tiene V0.3
+### Proyecto que ya tiene V0.4
 
 En Supabase **SQL Editor**, copia y ejecuta una sola vez:
 
 ```text
-supabase_v04_catalog_migration.sql
+supabase_v05_measurements_goals_migration.sql
 ```
 
-La migración crea `food_catalog`, agrega trazabilidad a `food_log` y configura funciones/RLS. Conserva los pacientes y registros existentes.
+La migración agrega el nivel de actividad, parámetros auditables de cálculo y la tabla `body_measurements` con RLS. Conserva pacientes, metas y registros existentes.
 
 ### Instalación nueva
 
@@ -33,6 +36,7 @@ Ejecuta en este orden:
 
 1. `supabase_schema.sql`
 2. `supabase_v04_catalog_migration.sql`
+3. `supabase_v05_measurements_goals_migration.sql`
 
 ## 2. Configurar Supabase Auth
 
@@ -101,11 +105,30 @@ Los alimentos creados por un nutriólogo sólo son visibles para esa cuenta y su
 - **FoodData Central:** búsqueda externa opcional. Datos CC0/dominio público. La app conserva el `fdcId`.
 - **INCMNSZ/CONABIO:** puede importarse desde CSV después de confirmar sus condiciones de reutilización y citación.
 - **SMAE:** no se incluye ni redistribuye. Requiere autorización o licencia para copiar su base comercial.
+- **Sistema Digital de Alimentos:** útil como referencia de equivalentes, pero el sitio indica “todos los derechos reservados”; no se integra por extracción automática sin autorización escrita.
 - **Datos profesionales:** el nutriólogo puede cargar valores propios y queda identificado como fuente.
 
 La aplicación no genera valores nutrimentales con IA. Calcula a partir de una fuente identificada y muestra el resultado antes de guardarlo.
 
-## 7. Flujo del paciente
+## 7. Cálculo de metas y composición corporal
+
+- El IMC se calcula como peso en kg dividido entre estatura en metros al cuadrado.
+- Para adultos, la calculadora puede estimar el gasto energético en reposo con Mifflin-St Jeor.
+- Si existe una medición Tanita/Omron con calorías basales, el nutriólogo puede usar ese valor como alternativa.
+- El factor de actividad, ajuste calórico, distribución de macros y agua orientativa son editables.
+- La fibra inicial se estima a razón de 14 g por cada 1000 kcal.
+- Ninguna estimación se guarda hasta que el usuario autorizado la aplique y confirme.
+
+Referencias técnicas:
+
+- https://pubmed.ncbi.nlm.nih.gov/2305711/
+- https://www.andeal.org/template.cfm?auth=1&key=621&template=guide_summary
+- https://www.ncbi.nlm.nih.gov/mesh/68015992
+- https://pubmed.ncbi.nlm.nih.gov/26514720/
+
+Estas fórmulas son estimaciones para adultos y no sustituyen la evaluación profesional ni la calorimetría indirecta.
+
+## 8. Flujo del paciente
 
 1. Crear y confirmar su cuenta.
 2. Vincularse con el código del nutriólogo.
@@ -115,7 +138,7 @@ La aplicación no genera valores nutrimentales con IA. Calcula a partir de una f
 6. Revisar el cálculo y confirmar.
 7. Consultar avances en **Mi día** e **Historial**.
 
-## 8. Ejecutar localmente
+## 9. Ejecutar localmente
 
 ```bash
 python3 -m venv .venv
@@ -124,7 +147,7 @@ pip install -r requirements.txt
 python3 -m streamlit run app.py
 ```
 
-## 9. Desplegar
+## 10. Desplegar
 
 Sube el código a GitHub sin `secrets.toml`. Streamlit Community Cloud actualizará la app desde el repositorio. Después verifica que **App settings > Secrets** incluya la configuración de Supabase y, opcionalmente, FoodData Central.
 

@@ -63,6 +63,9 @@ def _save_session(session: Any) -> None:
 def clear_auth_session() -> None:
     for key in AUTH_STATE_KEYS:
         st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if str(key).startswith("goal_"):
+            st.session_state.pop(key, None)
 
 
 def sign_up(email: str, password: str, full_name: str) -> bool:
@@ -141,7 +144,7 @@ def get_profile(patient_id: str) -> dict[str, Any]:
     response = (
         get_supabase()
         .table("patients")
-        .select("id,name,age,sex,weight,height")
+        .select("id,name,age,sex,weight,height,activity_level")
         .eq("id", patient_id)
         .single()
         .execute()
@@ -156,6 +159,7 @@ def update_profile(
     sex: str,
     weight: float,
     height: float,
+    activity_level: str = "Sedentaria",
 ) -> None:
     (
         get_supabase()
@@ -167,6 +171,7 @@ def update_profile(
                 "sex": sex,
                 "weight": float(weight),
                 "height": float(height),
+                "activity_level": activity_level.strip(),
             }
         )
         .eq("id", patient_id)
@@ -178,7 +183,12 @@ def get_goals(patient_id: str) -> dict[str, Any]:
     response = (
         get_supabase()
         .table("goals")
-        .select("patient_id,calories,protein,carbs,fat,fiber,water")
+        .select(
+            "patient_id,calories,protein,carbs,fat,fiber,water,"
+            "calculation_method,resting_calories,activity_factor,"
+            "calorie_adjustment_pct,protein_pct,carbs_pct,fat_pct,"
+            "water_ml_per_kg"
+        )
         .eq("patient_id", patient_id)
         .single()
         .execute()
@@ -194,6 +204,14 @@ def update_goals(
     fat: float,
     fiber: float,
     water: float,
+    calculation_method: str | None = None,
+    resting_calories: float | None = None,
+    activity_factor: float | None = None,
+    calorie_adjustment_pct: float | None = None,
+    protein_pct: float | None = None,
+    carbs_pct: float | None = None,
+    fat_pct: float | None = None,
+    water_ml_per_kg: float | None = None,
 ) -> None:
     (
         get_supabase()
@@ -207,8 +225,83 @@ def update_goals(
                 "fat": float(fat),
                 "fiber": float(fiber),
                 "water": float(water),
+                "calculation_method": calculation_method,
+                "resting_calories": resting_calories,
+                "activity_factor": activity_factor,
+                "calorie_adjustment_pct": calorie_adjustment_pct,
+                "protein_pct": protein_pct,
+                "carbs_pct": carbs_pct,
+                "fat_pct": fat_pct,
+                "water_ml_per_kg": water_ml_per_kg,
             },
             on_conflict="patient_id",
+        )
+        .execute()
+    )
+
+
+BODY_MEASUREMENT_COLUMNS = [
+    "id",
+    "patient_id",
+    "measured_on",
+    "device",
+    "bmi",
+    "body_fat_pct",
+    "muscle_pct",
+    "basal_calories",
+    "visceral_fat",
+    "metabolic_age",
+    "notes",
+]
+
+
+def get_body_measurements(patient_id: str, limit: int = 30) -> pd.DataFrame:
+    response = (
+        get_supabase()
+        .table("body_measurements")
+        .select(",".join(BODY_MEASUREMENT_COLUMNS))
+        .eq("patient_id", patient_id)
+        .order("measured_on", desc=True)
+        .order("created_at", desc=True)
+        .limit(min(max(int(limit), 1), 100))
+        .execute()
+    )
+    return pd.DataFrame(response.data or [], columns=BODY_MEASUREMENT_COLUMNS)
+
+
+def save_body_measurement(
+    patient_id: str,
+    measured_on: date,
+    device: str,
+    bmi: float | None = None,
+    body_fat_pct: float | None = None,
+    muscle_pct: float | None = None,
+    basal_calories: float | None = None,
+    visceral_fat: float | None = None,
+    metabolic_age: int | None = None,
+    notes: str = "",
+) -> None:
+    def optional_positive(value: float | int | None) -> float | int | None:
+        if value is None or float(value) <= 0:
+            return None
+        return value
+
+    (
+        get_supabase()
+        .table("body_measurements")
+        .insert(
+            {
+                "patient_id": patient_id,
+                "measured_on": measured_on.isoformat(),
+                "device": device.strip() or None,
+                "bmi": optional_positive(bmi),
+                "body_fat_pct": optional_positive(body_fat_pct),
+                "muscle_pct": optional_positive(muscle_pct),
+                "basal_calories": optional_positive(basal_calories),
+                "visceral_fat": optional_positive(visceral_fat),
+                "metabolic_age": optional_positive(metabolic_age),
+                "notes": notes.strip() or None,
+            }
         )
         .execute()
     )
@@ -342,7 +435,7 @@ def list_assigned_patients() -> list[dict[str, Any]]:
         return []
     response = (
         db.table("patients")
-        .select("id,name,age,sex,weight,height")
+        .select("id,name,age,sex,weight,height,activity_level")
         .in_("id", patient_ids)
         .order("name")
         .execute()
