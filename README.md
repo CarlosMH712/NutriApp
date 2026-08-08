@@ -1,10 +1,11 @@
-# 🥗 Mi Nutrición — V0.5 medidas caseras y composición corporal
+# 🥗 Mi Nutrición — V0.6 seguimiento y edición
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
 ## Funciones incluidas
 
 - Registro e inicio de sesión con correo y contraseña.
+- Autocompletado compatible con el administrador de contraseñas y biometría del dispositivo.
 - Roles de paciente y nutriólogo.
 - Expediente, metas y alimentos independientes por paciente.
 - Vinculación mediante un código compartido por el nutriólogo.
@@ -15,20 +16,22 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 - Porciones del SMAE expresadas como taza, pieza, cucharada, onza, envase u otra medida disponible.
 - Calculadora editable de gasto en reposo y metas diarias para adultos.
 - Registro histórico opcional de IMC, grasa, músculo, calorías basales, grasa visceral y edad metabólica.
+- Evolución gráfica de peso, grasa, músculo, IMC y grasa visceral.
+- Edición de alimentos registrados con recálculo proporcional por cantidad.
 - Registro manual disponible cuando el alimento no existe en el catálogo.
 - Trazabilidad de la fuente e identificador de cada alimento registrado.
 
 ## 1. Actualizar la base de datos
 
-### Proyecto que ya tiene V0.4
+### Proyecto que ya tiene V0.5
 
 En Supabase **SQL Editor**, copia y ejecuta una sola vez:
 
 ```text
-supabase_v05_measurements_goals_migration.sql
+supabase_v06_experience_tracking_migration.sql
 ```
 
-La migración agrega el nivel de actividad, parámetros auditables de cálculo y la tabla `body_measurements` con RLS. Conserva pacientes, metas y registros existentes.
+La migración agrega el peso fechado a `body_measurements`. Conserva pacientes, metas y registros existentes. Paciente y nutriólogo vinculado pueden corregir alimentos; la eliminación permanece reservada al paciente.
 
 ### Instalación nueva
 
@@ -37,6 +40,7 @@ Ejecuta en este orden:
 1. `supabase_schema.sql`
 2. `supabase_v04_catalog_migration.sql`
 3. `supabase_v05_measurements_goals_migration.sql`
+4. `supabase_v06_experience_tracking_migration.sql`
 
 ## 2. Configurar Supabase Auth
 
@@ -137,6 +141,8 @@ Estas fórmulas son estimaciones para adultos y no sustituyen la evaluación pro
 5. Elegir gramos o una porción disponible.
 6. Revisar el cálculo y confirmar.
 7. Consultar avances en **Mi día** e **Historial**.
+8. Usar el botón ✏️ para corregir un registro sin eliminarlo.
+9. Registrar peso y composición corporal para construir las gráficas de evolución.
 
 ## 9. Ejecutar localmente
 

@@ -245,6 +245,7 @@ BODY_MEASUREMENT_COLUMNS = [
     "patient_id",
     "measured_on",
     "device",
+    "weight_kg",
     "bmi",
     "body_fat_pct",
     "muscle_pct",
@@ -273,6 +274,7 @@ def save_body_measurement(
     patient_id: str,
     measured_on: date,
     device: str,
+    weight_kg: float | None = None,
     bmi: float | None = None,
     body_fat_pct: float | None = None,
     muscle_pct: float | None = None,
@@ -294,6 +296,7 @@ def save_body_measurement(
                 "patient_id": patient_id,
                 "measured_on": measured_on.isoformat(),
                 "device": device.strip() or None,
+                "weight_kg": optional_positive(weight_kg),
                 "bmi": optional_positive(bmi),
                 "body_fat_pct": optional_positive(body_fat_pct),
                 "muscle_pct": optional_positive(muscle_pct),
@@ -303,6 +306,18 @@ def save_body_measurement(
                 "notes": notes.strip() or None,
             }
         )
+        .execute()
+    )
+
+
+def update_patient_weight(patient_id: str, weight_kg: float) -> None:
+    if float(weight_kg) <= 0:
+        raise ValueError("El peso debe ser mayor que cero.")
+    (
+        get_supabase()
+        .table("patients")
+        .update({"weight": float(weight_kg)})
+        .eq("id", patient_id)
         .execute()
     )
 
@@ -387,6 +402,58 @@ def delete_food(food_id: int, patient_id: str) -> None:
         get_supabase()
         .table("food_log")
         .delete()
+        .eq("id", int(food_id))
+        .eq("patient_id", patient_id)
+        .execute()
+    )
+
+
+def update_food(
+    food_id: int,
+    patient_id: str,
+    meal: str,
+    food: str,
+    quantity: float,
+    unit: str,
+    calories: float,
+    protein: float,
+    carbs: float,
+    fat: float,
+    fiber: float,
+    water: float,
+    manual_override: bool = False,
+) -> None:
+    if not food.strip():
+        raise ValueError("El nombre del alimento es obligatorio.")
+    if float(quantity) < 0:
+        raise ValueError("La cantidad no puede ser negativa.")
+    nutrient_values = [calories, protein, carbs, fat, fiber, water]
+    if any(float(value) < 0 for value in nutrient_values):
+        raise ValueError("Los valores nutrimentales no pueden ser negativos.")
+    payload = {
+        "meal": meal,
+        "food": food.strip(),
+        "quantity": float(quantity),
+        "unit": unit.strip(),
+        "calories": float(calories),
+        "protein": float(protein),
+        "carbs": float(carbs),
+        "fat": float(fat),
+        "fiber": float(fiber),
+        "water": float(water),
+    }
+    if manual_override:
+        payload.update(
+            {
+                "catalog_food_id": None,
+                "source_name": "Registro editado manualmente",
+                "source_id": None,
+            }
+        )
+    (
+        get_supabase()
+        .table("food_log")
+        .update(payload)
         .eq("id", int(food_id))
         .eq("patient_id", patient_id)
         .execute()

@@ -29,7 +29,9 @@ from db import (
     sign_in,
     sign_out,
     sign_up,
+    update_food,
     update_goals,
+    update_patient_weight,
     update_profile,
 )
 from food_sources import (
@@ -65,9 +67,22 @@ def auth_screen() -> dict:
     login_tab, register_tab = st.tabs(["Iniciar sesión", "Crear cuenta"])
 
     with login_tab:
+        st.caption(
+            "En un dispositivo personal, permite que el navegador guarde tus "
+            "credenciales. Después podrá completarlas usando huella, Face ID o PIN."
+        )
         with st.form("login_form"):
-            email = st.text_input("Correo electrónico", key="login_email")
-            password = st.text_input("Contraseña", type="password", key="login_password")
+            email = st.text_input(
+                "Correo electrónico",
+                key="login_email",
+                autocomplete="username",
+            )
+            password = st.text_input(
+                "Contraseña",
+                type="password",
+                key="login_password",
+                autocomplete="current-password",
+            )
             login_submitted = st.form_submit_button(
                 "Entrar", use_container_width=True
             )
@@ -89,14 +104,20 @@ def auth_screen() -> dict:
         st.caption("Las cuentas nuevas se crean como pacientes.")
         with st.form("register_form"):
             full_name = st.text_input("Nombre completo")
-            new_email = st.text_input("Correo electrónico", key="register_email")
+            new_email = st.text_input(
+                "Correo electrónico",
+                key="register_email",
+                autocomplete="email",
+            )
             new_password = st.text_input(
                 "Contraseña (mínimo 8 caracteres)",
                 type="password",
                 key="register_password",
+                autocomplete="new-password",
             )
             confirm_password = st.text_input(
-                "Confirmar contraseña", type="password"
+                "Confirmar contraseña", type="password",
+                autocomplete="new-password",
             )
             register_submitted = st.form_submit_button(
                 "Crear mi cuenta", use_container_width=True
@@ -151,9 +172,145 @@ def totals_for_day(df: pd.DataFrame) -> dict[str, float]:
     return {key: float(df[key].fillna(0).sum()) for key in keys}
 
 
-def render_day(patient_id: str, goals: dict, selected_date: date, can_delete: bool) -> None:
+def _scaled_food_values(row: pd.Series, quantity: float) -> dict[str, float]:
+    original_quantity = float(row.get("quantity") or 0)
+    factor = float(quantity) / original_quantity if original_quantity > 0 else 1.0
+    return {
+        field: float(row.get(field) or 0) * factor
+        for field in ["calories", "protein", "carbs", "fat", "fiber", "water"]
+    }
+
+
+def render_food_editor(row: pd.Series, patient_id: str) -> None:
+    food_id = int(row["id"])
+    st.markdown("##### Editar registro")
+    mode = st.radio(
+        "Tipo de corrección",
+        ["Cantidad o tiempo de comida", "Todos los valores manualmente"],
+        horizontal=True,
+        key=f"edit_mode_{food_id}",
+    )
+    meal_options = ["Desayuno", "Comida", "Cena", "Snack"]
+    current_meal = str(row.get("meal") or "Desayuno")
+    meal_index = meal_options.index(current_meal) if current_meal in meal_options else 0
+
+    with st.form(f"edit_food_form_{food_id}"):
+        edit_col1, edit_col2 = st.columns(2)
+        with edit_col1:
+            edited_meal = st.selectbox(
+                "Tiempo de comida", meal_options, index=meal_index,
+                key=f"edit_meal_{food_id}",
+            )
+            edited_food = st.text_input(
+                "Alimento", value=str(row.get("food") or ""),
+                key=f"edit_name_{food_id}",
+                disabled=mode != "Todos los valores manualmente",
+            )
+        with edit_col2:
+            edited_quantity = st.number_input(
+                "Cantidad", min_value=0.01, value=float(row.get("quantity") or 1),
+                step=0.25, key=f"edit_quantity_{food_id}",
+            )
+            edited_unit = st.text_input(
+                "Unidad", value=str(row.get("unit") or "porción"),
+                key=f"edit_unit_{food_id}",
+            )
+
+        if mode == "Todos los valores manualmente":
+            st.caption("Corrige los valores correspondientes a la cantidad total indicada.")
+            nutrient_col1, nutrient_col2, nutrient_col3 = st.columns(3)
+            with nutrient_col1:
+                edited_calories = st.number_input(
+                    "Calorías (kcal)", min_value=0.0,
+                    value=float(row.get("calories") or 0), step=1.0,
+                    key=f"edit_calories_{food_id}",
+                )
+                edited_protein = st.number_input(
+                    "Proteína (g)", min_value=0.0,
+                    value=float(row.get("protein") or 0), step=0.1,
+                    key=f"edit_protein_{food_id}",
+                )
+            with nutrient_col2:
+                edited_carbs = st.number_input(
+                    "Carbohidratos (g)", min_value=0.0,
+                    value=float(row.get("carbs") or 0), step=0.1,
+                    key=f"edit_carbs_{food_id}",
+                )
+                edited_fat = st.number_input(
+                    "Grasas (g)", min_value=0.0,
+                    value=float(row.get("fat") or 0), step=0.1,
+                    key=f"edit_fat_{food_id}",
+                )
+            with nutrient_col3:
+                edited_fiber = st.number_input(
+                    "Fibra (g)", min_value=0.0,
+                    value=float(row.get("fiber") or 0), step=0.1,
+                    key=f"edit_fiber_{food_id}",
+                )
+                edited_water = st.number_input(
+                    "Agua (ml)", min_value=0.0,
+                    value=float(row.get("water") or 0), step=1.0,
+                    key=f"edit_water_{food_id}",
+                )
+            nutrient_values = {
+                "calories": edited_calories,
+                "protein": edited_protein,
+                "carbs": edited_carbs,
+                "fat": edited_fat,
+                "fiber": edited_fiber,
+                "water": edited_water,
+            }
+        else:
+            nutrient_values = _scaled_food_values(row, edited_quantity)
+            st.caption(
+                "Al guardar, calorías y macros se ajustarán proporcionalmente "
+                "a la nueva cantidad."
+            )
+
+        save_edit = st.form_submit_button(
+            "Guardar cambios", use_container_width=True
+        )
+
+    if save_edit:
+        try:
+            update_food(
+                food_id,
+                patient_id,
+                edited_meal,
+                edited_food,
+                edited_quantity,
+                edited_unit,
+                nutrient_values["calories"],
+                nutrient_values["protein"],
+                nutrient_values["carbs"],
+                nutrient_values["fat"],
+                nutrient_values["fiber"],
+                nutrient_values["water"],
+                manual_override=mode == "Todos los valores manualmente",
+            )
+            st.session_state.pop("editing_food_id", None)
+            st.session_state["food_update_notice"] = "Registro actualizado correctamente."
+            st.rerun()
+        except Exception as exc:
+            st.error("No se pudo actualizar el registro.")
+            st.code(str(exc))
+
+    if st.button("Cancelar edición", key=f"cancel_edit_{food_id}"):
+        st.session_state.pop("editing_food_id", None)
+        st.rerun()
+
+
+def render_day(
+    patient_id: str,
+    goals: dict,
+    selected_date: date,
+    can_edit: bool,
+    can_delete: bool,
+) -> None:
     st.title("🥗 Mi día" if can_delete else "🥗 Resumen del paciente")
     st.caption(selected_date.strftime("%d/%m/%Y"))
+    if notice := st.session_state.pop("food_update_notice", None):
+        st.success(str(notice))
     try:
         df = get_day_log(selected_date, patient_id)
     except Exception as exc:
@@ -208,7 +365,8 @@ def render_day(patient_id: str, goals: dict, selected_date: date, can_delete: bo
         meal_calories = meal_df["calories"].fillna(0).sum()
         with st.expander(f"{meal} · {meal_calories:.0f} kcal", expanded=True):
             for _, row in meal_df.iterrows():
-                widths = [5, 2, 1] if can_delete else [5, 2]
+                action_count = int(can_edit) + int(can_delete)
+                widths = [5, 2] + ([1] * action_count)
                 columns = st.columns(widths)
                 with columns[0]:
                     st.write(f"**{row['food']}**")
@@ -223,8 +381,17 @@ def render_day(patient_id: str, goals: dict, selected_date: date, can_delete: bo
                         st.caption(f"Fuente: {row['source_name']}")
                 with columns[1]:
                     st.write(f"**{float(row['calories']):.0f} kcal**")
+                action_index = 2
+                if can_edit:
+                    with columns[action_index]:
+                        if st.button(
+                            "✏️", key=f"edit_{row['id']}", help="Editar registro"
+                        ):
+                            st.session_state["editing_food_id"] = int(row["id"])
+                            st.rerun()
+                    action_index += 1
                 if can_delete:
-                    with columns[2]:
+                    with columns[action_index]:
                         if st.button("🗑️", key=f"delete_{row['id']}", help="Eliminar registro"):
                             try:
                                 delete_food(int(row["id"]), patient_id)
@@ -232,6 +399,8 @@ def render_day(patient_id: str, goals: dict, selected_date: date, can_delete: bo
                             except Exception as exc:
                                 st.error("No se pudo eliminar el alimento.")
                                 st.code(str(exc))
+                if st.session_state.get("editing_food_id") == int(row["id"]):
+                    render_food_editor(row, patient_id)
 
 
 def _catalog_label(food: dict) -> str:
@@ -425,53 +594,135 @@ def render_register(patient_id: str, selected_date: date) -> None:
 
 def render_history(patient_id: str) -> None:
     st.title("📊 Historial")
-    try:
-        raw_history = get_history(patient_id)
-    except Exception as exc:
-        st.error("No se pudo cargar el historial.")
-        st.code(str(exc))
-        return
-
-    if raw_history.empty:
-        st.info("Todavía no hay datos suficientes para mostrar historial.")
-        return
-
-    raw_history["log_date"] = pd.to_datetime(raw_history["log_date"])
-    numeric_cols = ["calories", "protein", "carbs", "fat", "fiber", "water"]
-    for col in numeric_cols:
-        raw_history[col] = pd.to_numeric(raw_history[col], errors="coerce").fillna(0)
-    df_history = (
-        raw_history.groupby("log_date", as_index=False)[numeric_cols]
-        .sum()
-        .sort_values("log_date")
+    nutrition_tab, body_tab = st.tabs(
+        ["🍽️ Alimentación", "⚖️ Evolución corporal"]
     )
-    start_date = pd.Timestamp(date.today() - timedelta(days=6))
-    week_df = df_history[df_history["log_date"] >= start_date]
 
-    st.subheader("Últimos 7 días")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Promedio energético", f"{week_df['calories'].mean():.0f} kcal/día" if not week_df.empty else "0 kcal/día")
-    c2.metric("Proteína promedio", f"{week_df['protein'].mean():.1f} g/día" if not week_df.empty else "0 g/día")
-    c3.metric("Días registrados", f"{len(week_df)} / 7")
-    st.subheader("🔥 Energía")
-    st.line_chart(week_df.set_index("log_date")[["calories"]])
-    st.subheader("🥩 Proteína")
-    st.line_chart(week_df.set_index("log_date")[["protein"]])
-    st.subheader("Datos")
-    display_df = df_history.copy()
-    display_df["log_date"] = display_df["log_date"].dt.strftime("%d/%m/%Y")
-    display_df = display_df.rename(
-        columns={
-            "log_date": "Fecha",
-            "calories": "kcal",
-            "protein": "Proteína (g)",
-            "carbs": "CHO (g)",
-            "fat": "Grasas (g)",
-            "fiber": "Fibra (g)",
-            "water": "Agua (ml)",
-        }
-    )
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    with nutrition_tab:
+        try:
+            raw_history = get_history(patient_id)
+        except Exception as exc:
+            st.error("No se pudo cargar el historial de alimentación.")
+            st.code(str(exc))
+            raw_history = pd.DataFrame()
+
+        if raw_history.empty:
+            st.info("Todavía no hay alimentos registrados.")
+        else:
+            raw_history["log_date"] = pd.to_datetime(raw_history["log_date"])
+            numeric_cols = ["calories", "protein", "carbs", "fat", "fiber", "water"]
+            for col in numeric_cols:
+                raw_history[col] = pd.to_numeric(
+                    raw_history[col], errors="coerce"
+                ).fillna(0)
+            df_history = (
+                raw_history.groupby("log_date", as_index=False)[numeric_cols]
+                .sum()
+                .sort_values("log_date")
+            )
+            start_date = pd.Timestamp(date.today() - timedelta(days=6))
+            week_df = df_history[df_history["log_date"] >= start_date]
+
+            st.subheader("Últimos 7 días")
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "Promedio energético",
+                f"{week_df['calories'].mean():.0f} kcal/día"
+                if not week_df.empty else "0 kcal/día",
+            )
+            c2.metric(
+                "Proteína promedio",
+                f"{week_df['protein'].mean():.1f} g/día"
+                if not week_df.empty else "0 g/día",
+            )
+            c3.metric("Días registrados", f"{len(week_df)} / 7")
+            st.subheader("🔥 Energía")
+            st.line_chart(week_df.set_index("log_date")[["calories"]])
+            st.subheader("🥩 Macronutrientes")
+            st.line_chart(
+                week_df.set_index("log_date")[["protein", "carbs", "fat"]]
+            )
+            st.subheader("Datos")
+            display_df = df_history.copy()
+            display_df["log_date"] = display_df["log_date"].dt.strftime("%d/%m/%Y")
+            display_df = display_df.rename(
+                columns={
+                    "log_date": "Fecha", "calories": "kcal",
+                    "protein": "Proteína (g)", "carbs": "CHO (g)",
+                    "fat": "Grasas (g)", "fiber": "Fibra (g)",
+                    "water": "Agua (ml)",
+                }
+            )
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    with body_tab:
+        try:
+            measurements = get_body_measurements(patient_id, limit=100)
+        except Exception as exc:
+            st.error("No se pudo cargar el progreso corporal.")
+            st.code(str(exc))
+            measurements = pd.DataFrame()
+
+        if measurements.empty:
+            st.info(
+                "Todavía no hay mediciones. Agrégalas desde "
+                "Perfil y metas → Composición corporal."
+            )
+        else:
+            progress_df = measurements.copy()
+            progress_df["measured_on"] = pd.to_datetime(progress_df["measured_on"])
+            progress_columns = [
+                "weight_kg", "bmi", "body_fat_pct", "muscle_pct",
+                "visceral_fat", "basal_calories", "metabolic_age",
+            ]
+            for column in progress_columns:
+                if column not in progress_df:
+                    progress_df[column] = pd.NA
+                progress_df[column] = pd.to_numeric(
+                    progress_df[column], errors="coerce"
+                )
+            progress_df = progress_df.sort_values("measured_on")
+            latest = progress_df.iloc[-1]
+
+            metric1, metric2, metric3 = st.columns(3)
+            metric1.metric(
+                "Peso actual",
+                f"{latest['weight_kg']:.1f} kg"
+                if pd.notna(latest["weight_kg"]) else "Sin dato",
+            )
+            metric2.metric(
+                "Grasa corporal",
+                f"{latest['body_fat_pct']:.1f}%"
+                if pd.notna(latest["body_fat_pct"]) else "Sin dato",
+            )
+            metric3.metric(
+                "Músculo",
+                f"{latest['muscle_pct']:.1f}%"
+                if pd.notna(latest["muscle_pct"]) else "Sin dato",
+            )
+
+            weight_chart = progress_df.dropna(subset=["weight_kg"])
+            if not weight_chart.empty:
+                st.subheader("⚖️ Peso")
+                st.line_chart(weight_chart.set_index("measured_on")[["weight_kg"]])
+
+            composition_columns = [
+                column for column in ["body_fat_pct", "muscle_pct"]
+                if progress_df[column].notna().any()
+            ]
+            if composition_columns:
+                st.subheader("📉 Composición corporal (%)")
+                st.line_chart(
+                    progress_df.set_index("measured_on")[composition_columns]
+                )
+
+            indicators = [
+                column for column in ["bmi", "visceral_fat"]
+                if progress_df[column].notna().any()
+            ]
+            if indicators:
+                st.subheader("Indicadores")
+                st.line_chart(progress_df.set_index("measured_on")[indicators])
 
 
 def render_profile_and_goals(
@@ -709,7 +960,7 @@ def render_profile_and_goals(
         if measurements_error:
             st.warning(
                 "La tabla de composición corporal aún no está disponible. "
-                "Ejecuta la migración V0.5 en Supabase."
+                "Ejecuta las migraciones V0.5 y V0.6 en Supabase."
             )
             with st.expander("Detalle técnico"):
                 st.code(str(measurements_error))
@@ -719,6 +970,10 @@ def render_profile_and_goals(
                 device = st.selectbox("Equipo", ["Tanita", "Omron", "Otro", "Sin especificar"])
                 measure_col1, measure_col2 = st.columns(2)
                 with measure_col1:
+                    measured_weight = st.number_input(
+                        "Peso (kg)", min_value=0.0,
+                        value=float(profile.get("weight") or 0), step=0.1,
+                    )
                     measured_bmi = st.number_input("IMC del equipo (opcional)", min_value=0.0, value=float(calculated_bmi), step=0.1)
                     body_fat_pct = st.number_input("Grasa corporal (%)", min_value=0.0, max_value=100.0, step=0.1)
                     muscle_pct = st.number_input("Músculo (%)", min_value=0.0, max_value=100.0, step=0.1)
@@ -726,15 +981,30 @@ def render_profile_and_goals(
                     basal_calories = st.number_input("Calorías basales del equipo", min_value=0.0, step=10.0)
                     visceral_fat = st.number_input("Grasa visceral (nivel)", min_value=0.0, step=0.5)
                     metabolic_age = st.number_input("Edad metabólica", min_value=0, max_value=150, step=1)
+                update_current_weight = st.checkbox(
+                    "Actualizar también el peso actual del perfil",
+                    value=True,
+                    disabled=not can_edit_profile,
+                )
                 measurement_notes = st.text_area("Notas (opcional)")
                 save_measurement = st.form_submit_button("Guardar medición", use_container_width=True)
             if save_measurement:
                 try:
                     save_body_measurement(
-                        patient_id, measured_on, device, measured_bmi,
-                        body_fat_pct, muscle_pct, basal_calories,
-                        visceral_fat, metabolic_age, measurement_notes,
+                        patient_id=patient_id,
+                        measured_on=measured_on,
+                        device=device,
+                        weight_kg=measured_weight,
+                        bmi=measured_bmi,
+                        body_fat_pct=body_fat_pct,
+                        muscle_pct=muscle_pct,
+                        basal_calories=basal_calories,
+                        visceral_fat=visceral_fat,
+                        metabolic_age=metabolic_age,
+                        notes=measurement_notes,
                     )
+                    if update_current_weight and measured_weight > 0:
+                        update_patient_weight(patient_id, measured_weight)
                     st.success("Medición guardada.")
                     st.rerun()
                 except Exception as exc:
@@ -747,14 +1017,15 @@ def render_profile_and_goals(
                 display_measurements = measurements.copy()
                 display_measurements = display_measurements.rename(
                     columns={
-                        "measured_on": "Fecha", "device": "Equipo", "bmi": "IMC",
+                        "measured_on": "Fecha", "device": "Equipo",
+                        "weight_kg": "Peso (kg)", "bmi": "IMC",
                         "body_fat_pct": "Grasa (%)", "muscle_pct": "Músculo (%)",
                         "basal_calories": "Calorías basales", "visceral_fat": "Grasa visceral",
                         "metabolic_age": "Edad metabólica", "notes": "Notas",
                     }
                 )
                 visible_columns = [
-                    "Fecha", "Equipo", "IMC", "Grasa (%)", "Músculo (%)",
+                    "Fecha", "Equipo", "Peso (kg)", "IMC", "Grasa (%)", "Músculo (%)",
                     "Calorías basales", "Grasa visceral", "Edad metabólica", "Notas",
                 ]
                 st.dataframe(
@@ -1010,7 +1281,13 @@ except Exception as exc:
     st.stop()
 
 if page in ("🏠 Mi día", "🏠 Resumen"):
-    render_day(patient_id, goals, selected_date, can_delete=role == "patient")
+    render_day(
+        patient_id,
+        goals,
+        selected_date,
+        can_edit=True,
+        can_delete=role == "patient",
+    )
 elif page == "➕ Registrar":
     render_register(patient_id, selected_date)
 elif page == "📊 Historial":
