@@ -1,4 +1,4 @@
-# 🥗 Mi Nutrición — V0.6 seguimiento y edición
+# 🥗 Mi Nutrición — V0.7 registro inteligente y recetas
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
@@ -18,20 +18,24 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 - Registro histórico opcional de IMC, grasa, músculo, calorías basales, grasa visceral y edad metabólica.
 - Evolución gráfica de peso, grasa, músculo, IMC y grasa visceral.
 - Edición de alimentos registrados con recálculo proporcional por cantidad.
+- Interpretación con IA de descripciones de comidas y desglose de platillos compuestos.
+- Revisión obligatoria de cada coincidencia antes de registrar nutrientes.
+- Platillos frecuentes del paciente y recetas compartidas por el nutriólogo.
+- Corrección y eliminación confirmada de mediciones corporales.
 - Registro manual disponible cuando el alimento no existe en el catálogo.
 - Trazabilidad de la fuente e identificador de cada alimento registrado.
 
 ## 1. Actualizar la base de datos
 
-### Proyecto que ya tiene V0.5
+### Proyecto que ya tiene V0.6
 
 En Supabase **SQL Editor**, copia y ejecuta una sola vez:
 
 ```text
-supabase_v06_experience_tracking_migration.sql
+supabase_v07_ai_recipes_migration.sql
 ```
 
-La migración agrega el peso fechado a `body_measurements`. Conserva pacientes, metas y registros existentes. Paciente y nutriólogo vinculado pueden corregir alimentos; la eliminación permanece reservada al paciente.
+La migración crea `meal_templates` y `meal_template_items` con RLS. Conserva pacientes, mediciones, catálogo y registros existentes.
 
 ### Instalación nueva
 
@@ -41,6 +45,7 @@ Ejecuta en este orden:
 2. `supabase_v04_catalog_migration.sql`
 3. `supabase_v05_measurements_goals_migration.sql`
 4. `supabase_v06_experience_tracking_migration.sql`
+5. `supabase_v07_ai_recipes_migration.sql`
 
 ## 2. Configurar Supabase Auth
 
@@ -68,12 +73,24 @@ Para habilitar la búsqueda de alimentos de USDA, solicita una API key en `https
 api_key = "TU_API_KEY"
 ```
 
+Para habilitar la interpretación de platillos agrega una clave de proyecto de OpenAI:
+
+```toml
+[openai]
+api_key = "TU_OPENAI_API_KEY"
+model = "gpt-4o-mini"
+```
+
 Pega esta configuración en:
 
 - local: `.streamlit/secrets.toml`;
 - Streamlit Community Cloud: **App settings > Secrets**.
 
 `secrets.toml` está excluido por `.gitignore` y nunca debe subirse a GitHub.
+
+La descripción de la comida se envía a la API sólo cuando el usuario presiona
+**Interpretar platillo**. No se envía nombre, correo ni expediente; la solicitud usa
+`store=False` y un identificador irreversible derivado del usuario para controles de abuso.
 
 ## 4. Crear la cuenta del nutriólogo
 
@@ -143,8 +160,21 @@ Estas fórmulas son estimaciones para adultos y no sustituyen la evaluación pro
 7. Consultar avances en **Mi día** e **Historial**.
 8. Usar el botón ✏️ para corregir un registro sin eliminarlo.
 9. Registrar peso y composición corporal para construir las gráficas de evolución.
+10. Opcionalmente describir un platillo, revisar sus componentes y confirmarlo.
+11. Guardar la combinación confirmada como platillo frecuente.
 
-## 9. Ejecutar localmente
+## 9. Registro inteligente y recetas
+
+- La IA extrae componentes, cantidades, preparación y preguntas pendientes.
+- Nunca genera valores nutrimentales: cada componente debe vincularse a SMAE,
+  CONABIO, USDA o al catálogo profesional.
+- Si no existe una coincidencia, el componente no puede guardarse hasta que el
+  usuario seleccione otra o lo excluya.
+- Los platillos frecuentes conservan los valores y fuentes que el paciente confirmó.
+- Las recetas del nutriólogo están disponibles para todos sus pacientes vinculados.
+- Una receta puede registrarse en 0.25, 0.5, 1 o más porciones.
+
+## 10. Ejecutar localmente
 
 ```bash
 python3 -m venv .venv
@@ -153,7 +183,7 @@ pip install -r requirements.txt
 python3 -m streamlit run app.py
 ```
 
-## 10. Desplegar
+## 11. Desplegar
 
 Sube el código a GitHub sin `secrets.toml`. Streamlit Community Cloud actualizará la app desde el repositorio. Después verifica que **App settings > Secrets** incluya la configuración de Supabase y, opcionalmente, FoodData Central.
 

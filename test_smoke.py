@@ -199,6 +199,39 @@ class AppSmokeTests(unittest.TestCase):
         body_metric = next(metric for metric in app.metric if metric.label == "Peso actual")
         self.assertEqual(body_metric.value, "78.0 kg")
 
+    def test_patient_can_delete_incorrect_body_measurement(self) -> None:
+        auth, profile, goals = self.patient_context()
+        measurement = pd.DataFrame(
+            [{
+                "id": 12, "patient_id": "patient-1", "measured_on": "2026-08-08",
+                "device": "Tanita", "weight_kg": 180.0, "bmi": 58.8,
+                "body_fat_pct": 70.0, "muscle_pct": 10.0,
+                "basal_calories": 2000, "visceral_fat": 20,
+                "metabolic_age": 80, "notes": "Captura incorrecta",
+            }]
+        )
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.get_profile", return_value=profile))
+            stack.enter_context(patch("db.get_goals", return_value=goals))
+            stack.enter_context(patch("db.get_body_measurements", return_value=measurement))
+            stack.enter_context(patch("db.patient_has_nutritionist", return_value=False))
+            delete_mock = stack.enter_context(patch("db.delete_body_measurement"))
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+            app.sidebar.radio[0].set_value("👤 Perfil y metas").run(timeout=20)
+            next(
+                button for button in app.button if button.label == "🗑️ Eliminar"
+            ).click().run(timeout=20)
+            next(
+                button for button in app.button
+                if button.label == "Confirmar eliminación"
+            ).click().run(timeout=20)
+
+        self.assertEqual(len(app.exception), 0)
+        delete_mock.assert_called_once_with(12, "patient-1")
+
     def test_nutritionist_can_open_profile_calculator(self) -> None:
         empty_log = pd.DataFrame(
             columns=[
@@ -267,6 +300,27 @@ class AppSmokeTests(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertIn("🍎 Catálogo de alimentos", [title.value for title in app.title])
+
+    def test_nutritionist_can_manage_recipes_without_patients(self) -> None:
+        auth = {
+            "id": "nutritionist-1",
+            "role": "nutritionist",
+            "full_name": "Nutrióloga prueba",
+            "patient_id": None,
+            "invite_code": "NUTRI123",
+            "email": "nutritionist@example.com",
+        }
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.list_assigned_patients", return_value=[]))
+            stack.enter_context(patch("db.list_owned_meal_templates", return_value=[]))
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+            app.sidebar.radio[0].set_value("🍲 Recetas").run(timeout=20)
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("🍲 Recetas del nutriólogo", [title.value for title in app.title])
 
 
 if __name__ == "__main__":

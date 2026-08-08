@@ -310,6 +310,59 @@ def save_body_measurement(
     )
 
 
+def update_body_measurement(
+    measurement_id: int,
+    patient_id: str,
+    measured_on: date,
+    device: str,
+    weight_kg: float | None = None,
+    bmi: float | None = None,
+    body_fat_pct: float | None = None,
+    muscle_pct: float | None = None,
+    basal_calories: float | None = None,
+    visceral_fat: float | None = None,
+    metabolic_age: int | None = None,
+    notes: str = "",
+) -> None:
+    def optional_positive(value: float | int | None) -> float | int | None:
+        if value is None or float(value) <= 0:
+            return None
+        return value
+
+    (
+        get_supabase()
+        .table("body_measurements")
+        .update(
+            {
+                "measured_on": measured_on.isoformat(),
+                "device": device.strip() or None,
+                "weight_kg": optional_positive(weight_kg),
+                "bmi": optional_positive(bmi),
+                "body_fat_pct": optional_positive(body_fat_pct),
+                "muscle_pct": optional_positive(muscle_pct),
+                "basal_calories": optional_positive(basal_calories),
+                "visceral_fat": optional_positive(visceral_fat),
+                "metabolic_age": optional_positive(metabolic_age),
+                "notes": notes.strip() or None,
+            }
+        )
+        .eq("id", int(measurement_id))
+        .eq("patient_id", patient_id)
+        .execute()
+    )
+
+
+def delete_body_measurement(measurement_id: int, patient_id: str) -> None:
+    (
+        get_supabase()
+        .table("body_measurements")
+        .delete()
+        .eq("id", int(measurement_id))
+        .eq("patient_id", patient_id)
+        .execute()
+    )
+
+
 def update_patient_weight(patient_id: str, weight_kg: float) -> None:
     if float(weight_kg) <= 0:
         raise ValueError("El peso debe ser mayor que cero.")
@@ -395,6 +448,45 @@ def save_food(
         )
         .execute()
     )
+
+
+def save_food_entries(
+    patient_id: str,
+    selected_date: date,
+    meal: str,
+    entries: list[dict[str, Any]],
+) -> int:
+    if not entries:
+        raise ValueError("No hay componentes para registrar.")
+    if len(entries) > 30:
+        raise ValueError("Registra un máximo de 30 componentes por platillo.")
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        food_name = str(entry.get("food_name") or "").strip()
+        quantity = float(entry.get("quantity") or 0)
+        if not food_name or quantity <= 0:
+            raise ValueError("Cada componente requiere nombre y cantidad positiva.")
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "log_date": selected_date.isoformat(),
+                "meal": meal,
+                "food": food_name,
+                "quantity": quantity,
+                "unit": str(entry.get("unit") or "porción").strip(),
+                "calories": max(float(entry.get("calories") or 0), 0),
+                "protein": max(float(entry.get("protein") or 0), 0),
+                "carbs": max(float(entry.get("carbs") or 0), 0),
+                "fat": max(float(entry.get("fat") or 0), 0),
+                "fiber": max(float(entry.get("fiber") or 0), 0),
+                "water": max(float(entry.get("water") or 0), 0),
+                "catalog_food_id": entry.get("catalog_food_id"),
+                "source_name": entry.get("source_name"),
+                "source_id": entry.get("source_id"),
+            }
+        )
+    get_supabase().table("food_log").insert(rows).execute()
+    return len(rows)
 
 
 def delete_food(food_id: int, patient_id: str) -> None:
@@ -624,3 +716,94 @@ def import_catalog_foods(rows: list[dict[str, Any]]) -> int:
         get_supabase().rpc("import_catalog_foods", {"p_foods": rows}).execute()
     )
     return int(response.data or 0)
+
+
+MEAL_TEMPLATE_COLUMNS = (
+    "id,name,template_type,patient_id,created_by,default_meal,created_at"
+)
+MEAL_TEMPLATE_ITEM_COLUMNS = (
+    "id,template_id,position,food_name,quantity,unit,calories,protein,"
+    "carbs,fat,fiber,water,catalog_food_id,source_name,source_id"
+)
+
+
+def create_meal_template(
+    name: str,
+    template_type: str,
+    patient_id: str | None,
+    default_meal: str,
+    items: list[dict[str, Any]],
+) -> str:
+    response = (
+        get_supabase()
+        .rpc(
+            "create_meal_template",
+            {
+                "p_name": name.strip(),
+                "p_template_type": template_type,
+                "p_patient_id": patient_id,
+                "p_default_meal": default_meal,
+                "p_items": items,
+            },
+        )
+        .execute()
+    )
+    return str(response.data)
+
+
+def _attach_template_items(templates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not templates:
+        return []
+    template_ids = [str(template["id"]) for template in templates]
+    response = (
+        get_supabase()
+        .table("meal_template_items")
+        .select(MEAL_TEMPLATE_ITEM_COLUMNS)
+        .in_("template_id", template_ids)
+        .order("position")
+        .execute()
+    )
+    items_by_template: dict[str, list[dict[str, Any]]] = {
+        template_id: [] for template_id in template_ids
+    }
+    for row in response.data or []:
+        items_by_template.setdefault(str(row["template_id"]), []).append(dict(row))
+    result: list[dict[str, Any]] = []
+    for template in templates:
+        item = dict(template)
+        item["items"] = items_by_template.get(str(template["id"]), [])
+        result.append(item)
+    return result
+
+
+def list_available_meal_templates(patient_id: str) -> list[dict[str, Any]]:
+    response = (
+        get_supabase()
+        .table("meal_templates")
+        .select(MEAL_TEMPLATE_COLUMNS)
+        .or_(f"patient_id.eq.{patient_id},template_type.eq.nutritionist_recipe")
+        .order("name")
+        .execute()
+    )
+    return _attach_template_items([dict(row) for row in (response.data or [])])
+
+
+def list_owned_meal_templates() -> list[dict[str, Any]]:
+    user_id = str(st.session_state.get("auth_user_id") or "")
+    if not user_id:
+        raise AuthenticationError("No se encontró el usuario autenticado.")
+    response = (
+        get_supabase()
+        .table("meal_templates")
+        .select(MEAL_TEMPLATE_COLUMNS)
+        .eq("created_by", user_id)
+        .order("name")
+        .execute()
+    )
+    return _attach_template_items([dict(row) for row in (response.data or [])])
+
+
+def delete_meal_template(template_id: str) -> None:
+    get_supabase().rpc(
+        "delete_meal_template", {"p_template_id": template_id}
+    ).execute()

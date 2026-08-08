@@ -10,6 +10,7 @@ from db import (
     DatabaseConfigError,
     clear_auth_session,
     create_catalog_food,
+    delete_body_measurement,
     delete_catalog_food,
     delete_food,
     get_auth_context,
@@ -30,6 +31,7 @@ from db import (
     sign_out,
     sign_up,
     update_food,
+    update_body_measurement,
     update_goals,
     update_patient_weight,
     update_profile,
@@ -44,6 +46,11 @@ from nutrition_calculations import (
     calculate_bmi,
     calculate_nutrition_targets,
     mifflin_st_jeor,
+)
+from meal_workflows import (
+    render_ai_register,
+    render_recipe_admin,
+    render_saved_meals,
 )
 
 
@@ -585,9 +592,20 @@ def render_manual_register(patient_id: str, selected_date: date) -> None:
 
 def render_register(patient_id: str, selected_date: date) -> None:
     st.title("➕ Registrar alimento")
-    catalog_tab, manual_tab = st.tabs(["🔎 Desde catálogo", "✍️ Registro manual"])
+    ai_tab, catalog_tab, saved_tab, manual_tab = st.tabs(
+        [
+            "✨ Describir comida",
+            "🔎 Desde catálogo",
+            "⭐ Platillos guardados",
+            "✍️ Registro manual",
+        ]
+    )
+    with ai_tab:
+        render_ai_register(patient_id, selected_date)
     with catalog_tab:
         render_catalog_register(patient_id, selected_date)
+    with saved_tab:
+        render_saved_meals(patient_id, selected_date)
     with manual_tab:
         render_manual_register(patient_id, selected_date)
 
@@ -723,6 +741,103 @@ def render_history(patient_id: str) -> None:
             if indicators:
                 st.subheader("Indicadores")
                 st.line_chart(progress_df.set_index("measured_on")[indicators])
+
+
+def _measurement_number(row: pd.Series, field: str) -> float:
+    value = row.get(field)
+    return float(value) if pd.notna(value) and value is not None else 0.0
+
+
+def render_body_measurement_editor(
+    row: pd.Series,
+    patient_id: str,
+    can_update_current_weight: bool,
+) -> None:
+    measurement_id = int(row["id"])
+    measured_date = pd.to_datetime(row.get("measured_on")).date()
+    device_options = ["Tanita", "Omron", "Otro", "Sin especificar"]
+    current_device = str(row.get("device") or "Sin especificar")
+    if current_device not in device_options:
+        device_options.insert(0, current_device)
+
+    st.markdown("##### Corregir medición")
+    with st.form(f"edit_measurement_form_{measurement_id}"):
+        edited_date = st.date_input("Fecha", value=measured_date)
+        edited_device = st.selectbox(
+            "Equipo", device_options, index=device_options.index(current_device)
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            edited_weight = st.number_input(
+                "Peso (kg)", min_value=0.0,
+                value=_measurement_number(row, "weight_kg"), step=0.1,
+            )
+            edited_bmi = st.number_input(
+                "IMC", min_value=0.0,
+                value=_measurement_number(row, "bmi"), step=0.1,
+            )
+            edited_fat = st.number_input(
+                "Grasa corporal (%)", min_value=0.0, max_value=100.0,
+                value=_measurement_number(row, "body_fat_pct"), step=0.1,
+            )
+            edited_muscle = st.number_input(
+                "Músculo (%)", min_value=0.0, max_value=100.0,
+                value=_measurement_number(row, "muscle_pct"), step=0.1,
+            )
+        with col2:
+            edited_basal = st.number_input(
+                "Calorías basales", min_value=0.0,
+                value=_measurement_number(row, "basal_calories"), step=10.0,
+            )
+            edited_visceral = st.number_input(
+                "Grasa visceral", min_value=0.0,
+                value=_measurement_number(row, "visceral_fat"), step=0.5,
+            )
+            edited_metabolic_age = st.number_input(
+                "Edad metabólica", min_value=0, max_value=150,
+                value=int(_measurement_number(row, "metabolic_age")), step=1,
+            )
+        edited_notes = st.text_area(
+            "Notas", value=str(row.get("notes") or "")
+        )
+        update_current_weight = st.checkbox(
+            "Actualizar también el peso actual del perfil",
+            value=False,
+            disabled=not can_update_current_weight,
+        )
+        save_changes = st.form_submit_button(
+            "Guardar corrección", use_container_width=True
+        )
+    if save_changes:
+        try:
+            update_body_measurement(
+                measurement_id=measurement_id,
+                patient_id=patient_id,
+                measured_on=edited_date,
+                device=edited_device,
+                weight_kg=edited_weight,
+                bmi=edited_bmi,
+                body_fat_pct=edited_fat,
+                muscle_pct=edited_muscle,
+                basal_calories=edited_basal,
+                visceral_fat=edited_visceral,
+                metabolic_age=edited_metabolic_age,
+                notes=edited_notes,
+            )
+            if update_current_weight and edited_weight > 0:
+                update_patient_weight(patient_id, edited_weight)
+            st.session_state.pop("editing_measurement_id", None)
+            st.session_state["measurement_notice"] = "Medición corregida."
+            st.rerun()
+        except Exception as exc:
+            st.error("No se pudo corregir la medición.")
+            st.code(str(exc))
+
+    if st.button(
+        "Cancelar corrección", key=f"cancel_measurement_edit_{measurement_id}"
+    ):
+        st.session_state.pop("editing_measurement_id", None)
+        st.rerun()
 
 
 def render_profile_and_goals(
@@ -944,6 +1059,8 @@ def render_profile_and_goals(
 
     with tab3:
         st.subheader("Mediciones de composición corporal")
+        if notice := st.session_state.pop("measurement_notice", None):
+            st.success(str(notice))
         try:
             calculated_bmi = calculate_bmi(
                 float(profile.get("weight") or 0),
@@ -1033,6 +1150,75 @@ def render_profile_and_goals(
                     use_container_width=True,
                     hide_index=True,
                 )
+                st.markdown("#### Corregir o eliminar mediciones")
+                for _, measurement in measurements.iterrows():
+                    measurement_id = int(measurement["id"])
+                    summary_date = pd.to_datetime(
+                        measurement.get("measured_on")
+                    ).strftime("%d/%m/%Y")
+                    weight_text = (
+                        f" · {_measurement_number(measurement, 'weight_kg'):.1f} kg"
+                        if _measurement_number(measurement, "weight_kg") > 0 else ""
+                    )
+                    with st.expander(
+                        f"{summary_date}{weight_text} · "
+                        f"{measurement.get('device') or 'Sin equipo'}"
+                    ):
+                        action1, action2 = st.columns(2)
+                        if action1.button(
+                            "✏️ Corregir",
+                            key=f"edit_measurement_{measurement_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["editing_measurement_id"] = measurement_id
+                            st.session_state.pop("deleting_measurement_id", None)
+                            st.rerun()
+                        if action2.button(
+                            "🗑️ Eliminar",
+                            key=f"delete_measurement_{measurement_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["deleting_measurement_id"] = measurement_id
+                            st.session_state.pop("editing_measurement_id", None)
+                            st.rerun()
+
+                        if st.session_state.get("editing_measurement_id") == measurement_id:
+                            render_body_measurement_editor(
+                                measurement,
+                                patient_id,
+                                can_update_current_weight=can_edit_profile,
+                            )
+
+                        if st.session_state.get("deleting_measurement_id") == measurement_id:
+                            st.warning(
+                                "Esta medición se eliminará definitivamente. "
+                                "El peso actual del perfil no cambiará."
+                            )
+                            confirm_col, cancel_col = st.columns(2)
+                            if confirm_col.button(
+                                "Confirmar eliminación",
+                                key=f"confirm_delete_measurement_{measurement_id}",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    delete_body_measurement(measurement_id, patient_id)
+                                    st.session_state.pop(
+                                        "deleting_measurement_id", None
+                                    )
+                                    st.session_state["measurement_notice"] = (
+                                        "Medición eliminada."
+                                    )
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error("No se pudo eliminar la medición.")
+                                    st.code(str(exc))
+                            if cancel_col.button(
+                                "Cancelar",
+                                key=f"cancel_delete_measurement_{measurement_id}",
+                                use_container_width=True,
+                            ):
+                                st.session_state.pop("deleting_measurement_id", None)
+                                st.rerun()
 
 
 CATALOG_IMPORT_COLUMNS = [
@@ -1252,7 +1438,10 @@ else:
         selected_label = st.sidebar.selectbox("Paciente", list(patient_by_label))
         patient_profile = patient_by_label[selected_label]
         patient_id = str(patient_profile["id"])
-    pages = ["🏠 Resumen", "📊 Historial", "👤 Perfil y metas", "🍎 Catálogo"]
+    pages = [
+        "🏠 Resumen", "📊 Historial", "👤 Perfil y metas",
+        "🍎 Catálogo", "🍲 Recetas",
+    ]
     page = st.sidebar.radio("Navegación", pages)
 
 selected_date = st.sidebar.date_input("Fecha", value=date.today())
@@ -1263,6 +1452,10 @@ if st.sidebar.button("Cerrar sesión", use_container_width=True):
 
 if role == "nutritionist" and page == "🍎 Catálogo":
     render_catalog_admin()
+    st.stop()
+
+if role == "nutritionist" and page == "🍲 Recetas":
+    render_recipe_admin()
     st.stop()
 
 if role == "nutritionist" and not patient_id:
