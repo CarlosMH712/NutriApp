@@ -9,21 +9,31 @@ from db import (
     AuthenticationError,
     DatabaseConfigError,
     clear_auth_session,
+    create_catalog_food,
+    delete_catalog_food,
     delete_food,
     get_auth_context,
     get_day_log,
     get_goals,
     get_history,
     get_profile,
+    import_catalog_foods,
     link_nutritionist,
     list_assigned_patients,
+    list_owned_catalog,
     patient_has_nutritionist,
     save_food,
+    search_catalog,
     sign_in,
     sign_out,
     sign_up,
     update_goals,
     update_profile,
+)
+from food_sources import (
+    FoodSourceError,
+    food_data_central_configured,
+    search_food_data_central,
 )
 
 
@@ -201,6 +211,8 @@ def render_day(patient_id: str, goals: dict, selected_date: date, can_delete: bo
                         f"G {float(row['fat']):.1f} g · "
                         f"Fibra {float(row['fiber']):.1f} g"
                     )
+                    if pd.notna(row.get("source_name")) and row.get("source_name"):
+                        st.caption(f"Fuente: {row['source_name']}")
                 with columns[1]:
                     st.write(f"**{float(row['calories']):.0f} kcal**")
                 if can_delete:
@@ -214,24 +226,157 @@ def render_day(patient_id: str, goals: dict, selected_date: date, can_delete: bo
                                 st.code(str(exc))
 
 
-def render_register(patient_id: str, selected_date: date) -> None:
-    st.title("➕ Registrar alimento")
-    st.write("Introduce los valores correspondientes a la cantidad realmente consumida.")
-    with st.form("food_form", clear_on_submit=True):
+def _catalog_label(food: dict) -> str:
+    brand = f" · {food['brand']}" if food.get("brand") else ""
+    source = str(food.get("source") or "Catálogo")
+    return f"{food['name']}{brand} — {source}"
+
+
+def render_catalog_register(patient_id: str, selected_date: date) -> None:
+    st.write("Busca un alimento y la app calculará los macros según la cantidad consumida.")
+    with st.form("catalog_search_form"):
+        query = st.text_input(
+            "Buscar alimento",
+            placeholder="Ej. huevo, arroz, tortilla o aguacate",
+        )
+        search_submitted = st.form_submit_button(
+            "🔎 Buscar", use_container_width=True
+        )
+
+    if search_submitted:
+        if len(query.strip()) < 2:
+            st.warning("Escribe al menos dos caracteres.")
+        else:
+            results: list[dict] = []
+            notices: list[str] = []
+            try:
+                results.extend(search_catalog(query))
+            except Exception as exc:
+                notices.append(f"No se pudo consultar el catálogo local: {exc}")
+
+            if food_data_central_configured():
+                try:
+                    results.extend(search_food_data_central(query))
+                except FoodSourceError as exc:
+                    notices.append(str(exc))
+            else:
+                notices.append(
+                    "FoodData Central aún no está configurado; se muestran sólo alimentos del catálogo del nutriólogo."
+                )
+
+            unique_results: dict[str, dict] = {}
+            for result in results:
+                unique_results[str(result["result_key"])] = result
+            st.session_state["food_search_results"] = list(unique_results.values())
+            st.session_state["food_search_notices"] = notices
+
+    for notice in st.session_state.get("food_search_notices", []):
+        st.caption(notice)
+
+    results = st.session_state.get("food_search_results", [])
+    if not results:
+        st.info("Busca un alimento para comenzar.")
+        return
+
+    selected_food = st.selectbox(
+        "Selecciona el alimento",
+        results,
+        format_func=_catalog_label,
+    )
+    st.caption(
+        "Valores de referencia por 100 g · "
+        f"{float(selected_food['calories_per_100g']):.0f} kcal · "
+        f"P {float(selected_food['protein_per_100g']):.1f} g · "
+        f"CHO {float(selected_food['carbs_per_100g']):.1f} g · "
+        f"G {float(selected_food['fat_per_100g']):.1f} g"
+    )
+
+    unit_options = ["gramos"]
+    portion_name = str(selected_food.get("portion_name") or "").strip()
+    portion_grams = float(selected_food.get("portion_grams") or 0)
+    if portion_name and portion_grams > 0:
+        unit_options.append(portion_name)
+
+    selection_key = str(selected_food["result_key"]).replace(":", "_")
+    unit_choice = st.selectbox(
+        "Unidad",
+        unit_options,
+        key=f"catalog_unit_{selection_key}",
+    )
+    default_quantity = 100.0 if unit_choice == "gramos" else 1.0
+    amount = st.number_input(
+        "Cantidad consumida",
+        min_value=0.01,
+        value=default_quantity,
+        step=1.0 if unit_choice == "gramos" else 0.5,
+        key=f"catalog_amount_{selection_key}_{unit_choice}",
+    )
+    grams = float(amount) if unit_choice == "gramos" else float(amount) * portion_grams
+    factor = grams / 100.0
+    calculated = {
+        "calories": float(selected_food["calories_per_100g"]) * factor,
+        "protein": float(selected_food["protein_per_100g"]) * factor,
+        "carbs": float(selected_food["carbs_per_100g"]) * factor,
+        "fat": float(selected_food["fat_per_100g"]) * factor,
+        "fiber": float(selected_food["fiber_per_100g"]) * factor,
+        "water": float(selected_food["water_per_100g"]) * factor,
+    }
+
+    st.write(f"**Cálculo para {grams:.1f} g**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Energía", f"{calculated['calories']:.0f} kcal")
+    c2.metric("Proteína", f"{calculated['protein']:.1f} g")
+    c3.metric("Carbohidratos", f"{calculated['carbs']:.1f} g")
+    c4.metric("Grasas", f"{calculated['fat']:.1f} g")
+
+    meal = st.selectbox(
+        "Tiempo de comida",
+        ["Desayuno", "Comida", "Cena", "Snack"],
+        key="catalog_meal",
+    )
+    if st.button("✅ Confirmar y registrar", use_container_width=True):
+        try:
+            save_food(
+                patient_id,
+                selected_date,
+                meal,
+                str(selected_food["name"]),
+                float(amount),
+                "g" if unit_choice == "gramos" else unit_choice,
+                calculated["calories"],
+                calculated["protein"],
+                calculated["carbs"],
+                calculated["fat"],
+                calculated["fiber"],
+                calculated["water"],
+                catalog_food_id=selected_food.get("catalog_food_id"),
+                source_name=str(selected_food.get("source") or "Catálogo"),
+                source_id=str(selected_food.get("source_id") or "") or None,
+            )
+            st.success(f"{selected_food['name']} registrado correctamente.")
+        except Exception as exc:
+            st.error("No se pudo registrar el alimento calculado.")
+            with st.expander("Detalle técnico"):
+                st.code(str(exc))
+
+
+def render_manual_register(patient_id: str, selected_date: date) -> None:
+    st.caption("Usa esta opción cuando el alimento todavía no exista en el catálogo.")
+    with st.form("manual_food_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
-            meal = st.selectbox("Tiempo de comida", ["Desayuno", "Comida", "Cena", "Snack"])
-            food = st.text_input("Alimento", placeholder="Ej. Huevo")
-            quantity = st.number_input("Cantidad", min_value=0.0, value=1.0, step=0.5)
-            unit = st.selectbox("Unidad", ["pieza", "g", "ml", "taza", "cucharada", "porción"])
+            meal = st.selectbox("Tiempo de comida", ["Desayuno", "Comida", "Cena", "Snack"], key="manual_meal")
+            food = st.text_input("Alimento", placeholder="Ej. Huevo", key="manual_food")
+            quantity = st.number_input("Cantidad", min_value=0.0, value=1.0, step=0.5, key="manual_quantity")
+            unit = st.selectbox("Unidad", ["pieza", "g", "ml", "taza", "cucharada", "porción"], key="manual_unit")
         with col2:
-            calories = st.number_input("Calorías (kcal)", min_value=0.0, step=10.0)
-            protein = st.number_input("Proteína (g)", min_value=0.0, step=1.0)
-            carbs = st.number_input("Carbohidratos (g)", min_value=0.0, step=1.0)
-            fat = st.number_input("Grasas (g)", min_value=0.0, step=1.0)
-            fiber = st.number_input("Fibra (g)", min_value=0.0, step=1.0)
-            water = st.number_input("Agua (ml)", min_value=0.0, step=50.0)
-        submitted = st.form_submit_button("✅ Registrar alimento", use_container_width=True)
+            calories = st.number_input("Calorías (kcal)", min_value=0.0, step=10.0, key="manual_calories")
+            protein = st.number_input("Proteína (g)", min_value=0.0, step=1.0, key="manual_protein")
+            carbs = st.number_input("Carbohidratos (g)", min_value=0.0, step=1.0, key="manual_carbs")
+            fat = st.number_input("Grasas (g)", min_value=0.0, step=1.0, key="manual_fat")
+            fiber = st.number_input("Fibra (g)", min_value=0.0, step=1.0, key="manual_fiber")
+            water = st.number_input("Agua (ml)", min_value=0.0, step=50.0, key="manual_water")
+        submitted = st.form_submit_button("✅ Registrar manualmente", use_container_width=True)
 
     if submitted:
         if not food.strip():
@@ -251,12 +396,22 @@ def render_register(patient_id: str, selected_date: date) -> None:
                     fat,
                     fiber,
                     water,
+                    source_name="Registro manual",
                 )
                 st.success(f"{food.strip()} registrado correctamente.")
             except Exception as exc:
                 st.error("No se pudo registrar el alimento.")
                 with st.expander("Detalle técnico"):
                     st.code(str(exc))
+
+
+def render_register(patient_id: str, selected_date: date) -> None:
+    st.title("➕ Registrar alimento")
+    catalog_tab, manual_tab = st.tabs(["🔎 Desde catálogo", "✍️ Registro manual"])
+    with catalog_tab:
+        render_catalog_register(patient_id, selected_date)
+    with manual_tab:
+        render_manual_register(patient_id, selected_date)
 
 
 def render_history(patient_id: str) -> None:
@@ -365,6 +520,163 @@ def render_profile_and_goals(
                 st.code(str(exc))
 
 
+CATALOG_IMPORT_COLUMNS = [
+    "name",
+    "brand",
+    "calories_per_100g",
+    "protein_per_100g",
+    "carbs_per_100g",
+    "fat_per_100g",
+    "fiber_per_100g",
+    "water_per_100g",
+    "portion_name",
+    "portion_grams",
+    "source",
+    "external_id",
+]
+
+CATALOG_CSV_TEMPLATE = ",".join(CATALOG_IMPORT_COLUMNS) + "\n"
+
+
+def render_catalog_admin() -> None:
+    st.title("🍎 Catálogo de alimentos")
+    st.write(
+        "Los alimentos creados aquí estarán disponibles para tus pacientes vinculados. "
+        "Los valores nutrimentales deben capturarse por cada 100 g."
+    )
+    create_tab, import_tab, list_tab = st.tabs(
+        ["Crear alimento", "Importar CSV", "Mis alimentos"]
+    )
+
+    with create_tab:
+        with st.form("create_catalog_food_form", clear_on_submit=True):
+            name = st.text_input("Nombre del alimento")
+            brand = st.text_input("Marca (opcional)")
+            col1, col2 = st.columns(2)
+            with col1:
+                calories = st.number_input("Calorías por 100 g", min_value=0.0, step=10.0)
+                protein = st.number_input("Proteína por 100 g", min_value=0.0, step=1.0)
+                carbs = st.number_input("Carbohidratos por 100 g", min_value=0.0, step=1.0)
+            with col2:
+                fat = st.number_input("Grasas por 100 g", min_value=0.0, step=1.0)
+                fiber = st.number_input("Fibra por 100 g", min_value=0.0, step=1.0)
+                water = st.number_input("Agua por 100 g", min_value=0.0, step=1.0)
+            st.caption("Porción casera opcional")
+            portion_col1, portion_col2 = st.columns(2)
+            with portion_col1:
+                portion_name = st.text_input("Nombre de la porción", placeholder="Ej. pieza mediana")
+            with portion_col2:
+                portion_grams = st.number_input("Gramos por porción", min_value=0.0, step=1.0)
+            submitted = st.form_submit_button("Guardar en catálogo", use_container_width=True)
+
+        if submitted:
+            if not name.strip():
+                st.error("Escribe el nombre del alimento.")
+            elif bool(portion_name.strip()) != bool(portion_grams > 0):
+                st.error("Completa tanto el nombre como los gramos de la porción.")
+            else:
+                try:
+                    create_catalog_food(
+                        name,
+                        brand,
+                        calories,
+                        protein,
+                        carbs,
+                        fat,
+                        fiber,
+                        water,
+                        portion_name,
+                        portion_grams if portion_grams > 0 else None,
+                    )
+                    st.success("Alimento agregado al catálogo.")
+                except Exception as exc:
+                    st.error("No se pudo crear el alimento.")
+                    with st.expander("Detalle técnico"):
+                        st.code(str(exc))
+
+    with import_tab:
+        st.write(
+            "Puedes importar una tabla autorizada o datos propios. Conserva el nombre "
+            "de la fuente y su identificador para mantener trazabilidad."
+        )
+        st.download_button(
+            "Descargar plantilla CSV",
+            data=CATALOG_CSV_TEMPLATE,
+            file_name="plantilla_catalogo_alimentos.csv",
+            mime="text/csv",
+        )
+        uploaded_file = st.file_uploader("Selecciona el CSV", type=["csv"])
+        if uploaded_file is not None:
+            try:
+                import_df = pd.read_csv(uploaded_file)
+                if "name" not in import_df.columns:
+                    st.error("El archivo debe contener la columna name.")
+                elif len(import_df) > 2000:
+                    st.error("Importa un máximo de 2000 alimentos por archivo.")
+                else:
+                    for column in CATALOG_IMPORT_COLUMNS:
+                        if column not in import_df.columns:
+                            import_df[column] = ""
+                    numeric_columns = [
+                        "calories_per_100g",
+                        "protein_per_100g",
+                        "carbs_per_100g",
+                        "fat_per_100g",
+                        "fiber_per_100g",
+                        "water_per_100g",
+                        "portion_grams",
+                    ]
+                    for column in numeric_columns:
+                        import_df[column] = pd.to_numeric(
+                            import_df[column], errors="coerce"
+                        ).fillna(0)
+                    import_df = import_df[CATALOG_IMPORT_COLUMNS].fillna("")
+                    st.dataframe(import_df.head(25), use_container_width=True, hide_index=True)
+                    if st.button("Importar alimentos", use_container_width=True):
+                        imported = import_catalog_foods(import_df.to_dict(orient="records"))
+                        st.success(f"Se importaron {imported} alimentos.")
+            except Exception as exc:
+                st.error("No se pudo procesar o importar el archivo.")
+                with st.expander("Detalle técnico"):
+                    st.code(str(exc))
+
+        st.warning(
+            "No importes el SMAE u otra base comercial sin contar con autorización de reutilización."
+        )
+
+    with list_tab:
+        try:
+            owned_foods = list_owned_catalog()
+        except Exception as exc:
+            st.error("No se pudo cargar el catálogo.")
+            st.code(str(exc))
+            owned_foods = []
+        if not owned_foods:
+            st.info("Todavía no has creado alimentos.")
+        else:
+            st.caption(f"{len(owned_foods)} alimentos")
+            for food in owned_foods[:200]:
+                col_name, col_values, col_delete = st.columns([4, 4, 1])
+                with col_name:
+                    st.write(f"**{food['name']}**")
+                    st.caption(str(food.get("brand") or food.get("source") or ""))
+                with col_values:
+                    st.caption(
+                        f"100 g: {float(food['calories_per_100g']):.0f} kcal · "
+                        f"P {float(food['protein_per_100g']):.1f} · "
+                        f"CHO {float(food['carbs_per_100g']):.1f} · "
+                        f"G {float(food['fat_per_100g']):.1f}"
+                    )
+                with col_delete:
+                    if st.button("🗑️", key=f"delete_catalog_{food['id']}"):
+                        try:
+                            delete_catalog_food(str(food["id"]))
+                            st.rerun()
+                        except Exception as exc:
+                            st.error("No se pudo eliminar.")
+                            st.code(str(exc))
+
+
 def render_link_nutritionist(patient_id: str) -> None:
     st.title("🔗 Mi nutriólogo")
     if patient_has_nutritionist(patient_id):
@@ -425,7 +737,7 @@ else:
         selected_label = st.sidebar.selectbox("Paciente", list(patient_by_label))
         patient_profile = patient_by_label[selected_label]
         patient_id = str(patient_profile["id"])
-    pages = ["🏠 Resumen", "📊 Historial", "👤 Perfil y metas"]
+    pages = ["🏠 Resumen", "📊 Historial", "👤 Perfil y metas", "🍎 Catálogo"]
     page = st.sidebar.radio("Navegación", pages)
 
 selected_date = st.sidebar.date_input("Fecha", value=date.today())
@@ -433,6 +745,10 @@ st.sidebar.divider()
 if st.sidebar.button("Cerrar sesión", use_container_width=True):
     sign_out()
     st.rerun()
+
+if role == "nutritionist" and page == "🍎 Catálogo":
+    render_catalog_admin()
+    st.stop()
 
 if role == "nutritionist" and not patient_id:
     st.title("👥 Pacientes")

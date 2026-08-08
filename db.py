@@ -12,6 +12,8 @@ AUTH_STATE_KEYS = (
     "access_token",
     "refresh_token",
     "auth_user_id",
+    "food_search_results",
+    "food_search_notices",
 )
 
 
@@ -217,7 +219,7 @@ def get_day_log(selected_date: date, patient_id: str) -> pd.DataFrame:
         get_supabase()
         .table("food_log")
         .select(
-            "id,log_date,meal,food,quantity,unit,calories,protein,carbs,fat,fiber,water"
+            "id,log_date,meal,food,quantity,unit,calories,protein,carbs,fat,fiber,water,source_name,source_id"
         )
         .eq("patient_id", patient_id)
         .eq("log_date", selected_date.isoformat())
@@ -238,6 +240,8 @@ def get_day_log(selected_date: date, patient_id: str) -> pd.DataFrame:
         "fat",
         "fiber",
         "water",
+        "source_name",
+        "source_id",
     ]
     return pd.DataFrame(response.data or [], columns=columns)
 
@@ -255,6 +259,9 @@ def save_food(
     fat: float,
     fiber: float,
     water: float,
+    catalog_food_id: str | None = None,
+    source_name: str | None = None,
+    source_id: str | None = None,
 ) -> None:
     (
         get_supabase()
@@ -273,6 +280,9 @@ def save_food(
                 "fat": float(fat),
                 "fiber": float(fiber),
                 "water": float(water),
+                "catalog_food_id": catalog_food_id,
+                "source_name": source_name,
+                "source_id": source_id,
             }
         )
         .execute()
@@ -356,3 +366,101 @@ def link_nutritionist(invite_code: str) -> None:
     get_supabase().rpc(
         "link_my_nutritionist", {"p_invite_code": invite_code.strip().upper()}
     ).execute()
+
+
+CATALOG_COLUMNS = (
+    "id,name,brand,source,external_id,created_by,verified,"
+    "calories_per_100g,protein_per_100g,carbs_per_100g,"
+    "fat_per_100g,fiber_per_100g,water_per_100g,"
+    "portion_name,portion_grams"
+)
+
+
+def _catalog_result(row: dict[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    result["result_key"] = f"catalog:{row['id']}"
+    result["catalog_food_id"] = str(row["id"])
+    result["source_id"] = row.get("external_id") or str(row["id"])
+    return result
+
+
+def search_catalog(query: str, limit: int = 25) -> list[dict[str, Any]]:
+    clean_query = query.strip().replace("%", "").replace("_", "")
+    if not clean_query:
+        return []
+    response = (
+        get_supabase()
+        .table("food_catalog")
+        .select(CATALOG_COLUMNS)
+        .ilike("name", f"%{clean_query}%")
+        .order("name")
+        .limit(min(max(int(limit), 1), 50))
+        .execute()
+    )
+    return [_catalog_result(dict(row)) for row in (response.data or [])]
+
+
+def list_owned_catalog() -> list[dict[str, Any]]:
+    user_id = str(st.session_state.get("auth_user_id") or "")
+    if not user_id:
+        raise AuthenticationError("No se encontró el usuario autenticado.")
+    response = (
+        get_supabase()
+        .table("food_catalog")
+        .select(CATALOG_COLUMNS)
+        .eq("created_by", user_id)
+        .order("name")
+        .execute()
+    )
+    return [_catalog_result(dict(row)) for row in (response.data or [])]
+
+
+def create_catalog_food(
+    name: str,
+    brand: str,
+    calories_per_100g: float,
+    protein_per_100g: float,
+    carbs_per_100g: float,
+    fat_per_100g: float,
+    fiber_per_100g: float,
+    water_per_100g: float,
+    portion_name: str = "",
+    portion_grams: float | None = None,
+    source: str = "nutritionist",
+    external_id: str = "",
+) -> str:
+    response = (
+        get_supabase()
+        .rpc(
+            "create_catalog_food",
+            {
+                "p_name": name.strip(),
+                "p_brand": brand.strip(),
+                "p_source": source.strip(),
+                "p_external_id": external_id.strip(),
+                "p_calories_per_100g": float(calories_per_100g),
+                "p_protein_per_100g": float(protein_per_100g),
+                "p_carbs_per_100g": float(carbs_per_100g),
+                "p_fat_per_100g": float(fat_per_100g),
+                "p_fiber_per_100g": float(fiber_per_100g),
+                "p_water_per_100g": float(water_per_100g),
+                "p_portion_name": portion_name.strip(),
+                "p_portion_grams": (
+                    float(portion_grams) if portion_grams and portion_grams > 0 else None
+                ),
+            },
+        )
+        .execute()
+    )
+    return str(response.data)
+
+
+def delete_catalog_food(food_id: str) -> None:
+    get_supabase().rpc("delete_catalog_food", {"p_food_id": food_id}).execute()
+
+
+def import_catalog_foods(rows: list[dict[str, Any]]) -> int:
+    response = (
+        get_supabase().rpc("import_catalog_foods", {"p_foods": rows}).execute()
+    )
+    return int(response.data or 0)
