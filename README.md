@@ -1,4 +1,4 @@
-# 🥗 Mi Nutrición — V0.8 registro inteligente con Gemini
+# 🥗 Mi Nutrición — V0.8.1 registro inteligente con Gemini
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
@@ -14,6 +14,7 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 - Búsqueda opcional en USDA FoodData Central.
 - Cálculo automático de macros por gramos o porción casera.
 - Porciones del SMAE expresadas como taza, pieza, cucharada, onza, envase u otra medida disponible.
+- Registro de líquidos en mililitros y actualización automática de hidratación para agua potable.
 - Calculadora editable de gasto en reposo y metas diarias para adultos.
 - Registro histórico opcional de IMC, grasa, músculo, calorías basales, grasa visceral y edad metabólica.
 - Evolución gráfica de peso, grasa, músculo, IMC y grasa visceral.

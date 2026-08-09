@@ -5,10 +5,45 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from meal_ai import ParsedFood, ParsedMeal, interpret_meal
+from food_measurements import (
+    MILLILITERS,
+    calculate_food_serving,
+    effective_water_ml,
+    measurement_options,
+)
 from meal_workflows import calculate_component, rank_catalog_matches
 
 
 class MealAITests(unittest.TestCase):
+    def test_plain_water_offers_ml_and_updates_hydration_without_catalog_water(self) -> None:
+        water = {
+            "name": "Agua purificada",
+            "portion_name": "taza",
+            "portion_grams": 240,
+            "calories_per_100g": 0,
+            "protein_per_100g": 0,
+            "carbs_per_100g": 0,
+            "fat_per_100g": 0,
+            "fiber_per_100g": 0,
+            "water_per_100g": 0,
+        }
+        self.assertIn(MILLILITERS, measurement_options(water))
+        result = calculate_food_serving(water, 500, MILLILITERS)
+        self.assertEqual(result["unit"], "ml")
+        self.assertEqual(result["grams"], 500)
+        self.assertEqual(result["water"], 500)
+
+    def test_existing_plain_water_cup_is_recovered_for_daily_total(self) -> None:
+        self.assertEqual(effective_water_ml("Agua", 2, "taza", 0), 480)
+
+    def test_solid_food_does_not_offer_ml(self) -> None:
+        apple = {
+            "name": "Manzana",
+            "portion_name": "pieza",
+            "portion_grams": 150,
+        }
+        self.assertNotIn(MILLILITERS, measurement_options(apple))
+
     def test_catalog_ranking_prefers_semantic_name_match(self) -> None:
         candidates = [
             {"result_key": "1", "name": "Pan de hamburguesa"},

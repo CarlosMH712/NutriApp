@@ -9,7 +9,7 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 
-APP_FILE = Path(__file__).resolve().parents[1] / "app.py"
+APP_FILE = Path(__file__).resolve().parent / "app.py"
 
 
 class AppSmokeTests(unittest.TestCase):

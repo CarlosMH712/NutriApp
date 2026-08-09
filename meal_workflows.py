@@ -20,6 +20,13 @@ from food_sources import (
     food_data_central_configured,
     search_food_data_central,
 )
+from food_measurements import (
+    GRAMS,
+    MILLILITERS,
+    calculate_food_serving,
+    measurement_options,
+    volume_ml_from_quantity,
+)
 from meal_ai import MealAIConfigError, MealAIError, gemini_configured, interpret_meal
 
 
@@ -114,30 +121,7 @@ def _portion_matches(parsed_unit: str, portion_name: str) -> bool:
 
 
 def calculate_component(food: dict, amount: float, unit_choice: str) -> dict:
-    portion_name = str(food.get("portion_name") or "").strip()
-    portion_grams = float(food.get("portion_grams") or 0)
-    grams = (
-        float(amount)
-        if unit_choice == "gramos"
-        else float(amount) * portion_grams
-    )
-    factor = grams / 100.0
-    values = {
-        field: float(food.get(f"{field}_per_100g") or 0) * factor
-        for field in NUTRIENT_FIELDS
-    }
-    values.update(
-        {
-            "food_name": str(food.get("name") or "Alimento"),
-            "quantity": float(amount),
-            "unit": "g" if unit_choice == "gramos" else portion_name,
-            "grams": grams,
-            "catalog_food_id": food.get("catalog_food_id"),
-            "source_name": str(food.get("source") or "Catálogo"),
-            "source_id": str(food.get("source_id") or "") or None,
-        }
-    )
-    return values
+    return calculate_food_serving(food, amount, unit_choice)
 
 
 def _scaled_template_items(items: list[dict], multiplier: float) -> list[dict]:
@@ -161,6 +145,9 @@ def _show_totals(entries: list[dict]) -> None:
     col2.metric("Proteína", f"{_total(entries, 'protein'):.1f} g")
     col3.metric("Carbohidratos", f"{_total(entries, 'carbs'):.1f} g")
     col4.metric("Grasas", f"{_total(entries, 'fat'):.1f} g")
+    hydration = _total(entries, "water")
+    if hydration > 0:
+        st.caption(f"💧 Hidratación contabilizada: {hydration:.0f} ml")
 
 
 def _clear_ai_result() -> None:
@@ -270,22 +257,29 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
                 key=f"ai_match_{run_id}_{index}",
             )
             portion_name = str(selected_food.get("portion_name") or "").strip()
-            portion_grams = float(selected_food.get("portion_grams") or 0)
-            units = ["gramos"]
-            if portion_name and portion_grams > 0:
-                units.append(portion_name)
-            default_unit_index = (
-                1 if len(units) > 1 and _portion_matches(
-                    str(item.get("unit") or ""), portion_name
-                ) else 0
+            units = measurement_options(selected_food, item.get("unit"))
+            parsed_volume_ml = volume_ml_from_quantity(
+                float(item.get("quantity") or 0), item.get("unit")
             )
+            if portion_name in units and _portion_matches(
+                str(item.get("unit") or ""), portion_name
+            ):
+                default_unit_index = units.index(portion_name)
+            elif parsed_volume_ml is not None and MILLILITERS in units:
+                default_unit_index = units.index(MILLILITERS)
+            else:
+                default_unit_index = 0
             match_key = str(selected_food.get("result_key") or index).replace(":", "_")
             unit_choice = st.selectbox(
                 "Unidad", units, index=default_unit_index,
                 key=f"ai_unit_{run_id}_{index}_{match_key}",
             )
-            if unit_choice == "gramos":
-                default_amount = float(item.get("estimated_grams") or 100)
+            if unit_choice in {GRAMS, MILLILITERS}:
+                default_amount = float(
+                    parsed_volume_ml
+                    if unit_choice == MILLILITERS and parsed_volume_ml is not None
+                    else item.get("estimated_grams") or 100
+                )
                 step = 1.0
             else:
                 default_amount = float(item.get("quantity") or 1)
@@ -298,11 +292,13 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
                 key=f"ai_amount_{run_id}_{index}_{match_key}_{unit_choice}",
             )
             component = calculate_component(selected_food, amount, unit_choice)
+            volume_note = " · conversión aproximada 1 ml = 1 g" if unit_choice == MILLILITERS else ""
             st.caption(
                 f"Equivale a {component['grams']:.1f} g · "
                 f"{component['calories']:.0f} kcal · "
                 f"P {component['protein']:.1f} g · "
                 f"CHO {component['carbs']:.1f} g · G {component['fat']:.1f} g"
+                f"{volume_note}"
             )
             if include:
                 confirmed_items.append(component)
@@ -484,16 +480,12 @@ def render_recipe_admin() -> None:
             "Alimento", results, format_func=_food_label,
             key="recipe_selected_food",
         )
-        portion_name = str(selected_food.get("portion_name") or "").strip()
-        portion_grams = float(selected_food.get("portion_grams") or 0)
-        units = ["gramos"] + (
-            [portion_name] if portion_name and portion_grams > 0 else []
-        )
+        units = measurement_options(selected_food)
         unit_choice = st.selectbox("Unidad", units, key="recipe_component_unit")
         amount = st.number_input(
             "Cantidad", min_value=0.01,
-            value=100.0 if unit_choice == "gramos" else 1.0,
-            step=1.0 if unit_choice == "gramos" else 0.25,
+            value=100.0 if unit_choice in {GRAMS, MILLILITERS} else 1.0,
+            step=1.0 if unit_choice in {GRAMS, MILLILITERS} else 0.25,
             key=f"recipe_component_amount_{unit_choice}",
         )
         preview = calculate_component(selected_food, amount, unit_choice)
