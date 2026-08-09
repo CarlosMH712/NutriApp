@@ -5,6 +5,12 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
+from app_timezone import (
+    TIMEZONE_LABELS,
+    local_today,
+    normalize_timezone,
+    timezone_label,
+)
 from db import (
     AuthenticationError,
     DatabaseConfigError,
@@ -31,6 +37,7 @@ from db import (
     sign_out,
     sign_up,
     update_food,
+    update_account_timezone,
     update_body_measurement,
     update_goals,
     update_patient_weight,
@@ -56,6 +63,7 @@ from nutrition_calculations import (
     calculate_nutrition_targets,
     mifflin_st_jeor,
 )
+from nutrition_charts import stable_line_chart
 from meal_workflows import (
     render_ai_register,
     render_recipe_admin,
@@ -650,7 +658,7 @@ def render_register(patient_id: str, selected_date: date) -> None:
         render_manual_register(patient_id, selected_date)
 
 
-def render_history(patient_id: str) -> None:
+def render_history(patient_id: str, current_date: date) -> None:
     st.title("📊 Historial")
     nutrition_tab, body_tab = st.tabs(
         ["🍽️ Alimentación", "⚖️ Evolución corporal"]
@@ -684,7 +692,7 @@ def render_history(patient_id: str) -> None:
                 .sum()
                 .sort_values("log_date")
             )
-            start_date = pd.Timestamp(date.today() - timedelta(days=6))
+            start_date = pd.Timestamp(current_date - timedelta(days=6))
             week_df = df_history[df_history["log_date"] >= start_date]
 
             st.subheader("Últimos 7 días")
@@ -701,10 +709,32 @@ def render_history(patient_id: str) -> None:
             )
             c3.metric("Días registrados", f"{len(week_df)} / 7")
             st.subheader("🔥 Energía")
-            st.line_chart(week_df.set_index("log_date")[["calories"]])
+            st.altair_chart(
+                stable_line_chart(
+                    week_df,
+                    "log_date",
+                    {"calories": "Calorías"},
+                    "kcal",
+                    zero=True,
+                ),
+                use_container_width=True,
+                on_select="ignore",
+            )
             st.subheader("🥩 Macronutrientes")
-            st.line_chart(
-                week_df.set_index("log_date")[["protein", "carbs", "fat"]]
+            st.altair_chart(
+                stable_line_chart(
+                    week_df,
+                    "log_date",
+                    {
+                        "protein": "Proteína",
+                        "carbs": "Carbohidratos",
+                        "fat": "Grasas",
+                    },
+                    "Gramos",
+                    zero=True,
+                ),
+                use_container_width=True,
+                on_select="ignore",
             )
             st.subheader("Datos")
             display_df = df_history.copy()
@@ -768,7 +798,16 @@ def render_history(patient_id: str) -> None:
             weight_chart = progress_df.dropna(subset=["weight_kg"])
             if not weight_chart.empty:
                 st.subheader("⚖️ Peso")
-                st.line_chart(weight_chart.set_index("measured_on")[["weight_kg"]])
+                st.altair_chart(
+                    stable_line_chart(
+                        weight_chart,
+                        "measured_on",
+                        {"weight_kg": "Peso"},
+                        "kg",
+                    ),
+                    use_container_width=True,
+                    on_select="ignore",
+                )
 
             composition_columns = [
                 column for column in ["body_fat_pct", "muscle_pct"]
@@ -776,8 +815,18 @@ def render_history(patient_id: str) -> None:
             ]
             if composition_columns:
                 st.subheader("📉 Composición corporal (%)")
-                st.line_chart(
-                    progress_df.set_index("measured_on")[composition_columns]
+                st.altair_chart(
+                    stable_line_chart(
+                        progress_df,
+                        "measured_on",
+                        {
+                            "body_fat_pct": "Grasa corporal",
+                            "muscle_pct": "Músculo",
+                        },
+                        "Porcentaje",
+                    ),
+                    use_container_width=True,
+                    on_select="ignore",
                 )
 
             indicators = [
@@ -786,7 +835,16 @@ def render_history(patient_id: str) -> None:
             ]
             if indicators:
                 st.subheader("Indicadores")
-                st.line_chart(progress_df.set_index("measured_on")[indicators])
+                st.altair_chart(
+                    stable_line_chart(
+                        progress_df,
+                        "measured_on",
+                        {"bmi": "IMC", "visceral_fat": "Grasa visceral"},
+                        "Valor",
+                    ),
+                    use_container_width=True,
+                    on_select="ignore",
+                )
 
 
 def _measurement_number(row: pd.Series, field: str) -> float:
@@ -892,6 +950,7 @@ def render_profile_and_goals(
     goals: dict,
     can_edit_profile: bool,
     can_edit_goals: bool,
+    current_date: date,
 ) -> None:
     st.title("👤 Perfil y metas")
     try:
@@ -1129,7 +1188,7 @@ def render_profile_and_goals(
                 st.code(str(measurements_error))
         else:
             with st.form("body_measurement_form", clear_on_submit=True):
-                measured_on = st.date_input("Fecha de medición", value=date.today())
+                measured_on = st.date_input("Fecha de medición", value=current_date)
                 device = st.selectbox("Equipo", ["Tanita", "Omron", "Otro", "Sin especificar"])
                 measure_col1, measure_col2 = st.columns(2)
                 with measure_col1:
@@ -1460,6 +1519,8 @@ except Exception as exc:
     st.stop()
 
 role = str(auth.get("role") or "patient")
+account_timezone = normalize_timezone(auth.get("timezone"))
+account_today = local_today(account_timezone)
 st.sidebar.title("🥗 Mi Nutrición")
 st.sidebar.caption("Paciente" if role == "patient" else "Panel del nutriólogo")
 st.sidebar.write(f"### {auth.get('full_name') or auth.get('email')}")
@@ -1490,7 +1551,40 @@ else:
     ]
     page = st.sidebar.radio("Navegación", pages)
 
-selected_date = st.sidebar.date_input("Fecha", value=date.today())
+with st.sidebar.expander("⚙️ Configuración"):
+    timezone_labels = list(TIMEZONE_LABELS)
+    current_timezone_label = timezone_label(account_timezone)
+    selected_timezone_label = st.selectbox(
+        "Zona horaria",
+        timezone_labels,
+        index=timezone_labels.index(current_timezone_label),
+        key="account_timezone",
+    )
+    st.caption(f"Fecha local actual: {account_today.strftime('%d/%m/%Y')}")
+    if st.button("Guardar zona horaria", use_container_width=True):
+        try:
+            update_account_timezone(
+                str(auth.get("id") or ""),
+                TIMEZONE_LABELS[selected_timezone_label],
+            )
+            st.session_state.pop("selected_log_date", None)
+            st.session_state["timezone_notice"] = "Zona horaria actualizada."
+            st.rerun()
+        except Exception as exc:
+            st.error(
+                "No se pudo guardar. Ejecuta primero la migración "
+                "supabase_v08_2_timezone_migration.sql."
+            )
+            st.code(str(exc))
+
+if timezone_notice := st.session_state.pop("timezone_notice", None):
+    st.sidebar.success(str(timezone_notice))
+
+selected_date = st.sidebar.date_input(
+    "Fecha",
+    value=account_today,
+    key="selected_log_date",
+)
 st.sidebar.divider()
 if st.sidebar.button("Cerrar sesión", use_container_width=True):
     sign_out()
@@ -1530,7 +1624,7 @@ if page in ("🏠 Mi día", "🏠 Resumen"):
 elif page == "➕ Registrar":
     render_register(patient_id, selected_date)
 elif page == "📊 Historial":
-    render_history(patient_id)
+    render_history(patient_id, account_today)
 elif page == "👤 Perfil y metas":
     patient_linked = patient_has_nutritionist(patient_id)
     render_profile_and_goals(
@@ -1539,6 +1633,7 @@ elif page == "👤 Perfil y metas":
         goals,
         can_edit_profile=True,
         can_edit_goals=role == "nutritionist" or not patient_linked,
+        current_date=account_today,
     )
 elif page == "🔗 Mi nutriólogo":
     render_link_nutritionist(patient_id)

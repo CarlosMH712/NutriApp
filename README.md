@@ -1,4 +1,4 @@
-# 🥗 Mi Nutrición — V0.8.1 registro inteligente con Gemini
+# 🥗 Mi Nutrición — V0.8.2 zona horaria y gráficas estables
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
@@ -18,6 +18,8 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 - Calculadora editable de gasto en reposo y metas diarias para adultos.
 - Registro histórico opcional de IMC, grasa, músculo, calorías basales, grasa visceral y edad metabólica.
 - Evolución gráfica de peso, grasa, músculo, IMC y grasa visceral.
+- Zona horaria configurable por cuenta para usar siempre la fecha local correcta.
+- Gráficas con detalles al pasar el cursor, sin zoom o desplazamiento accidental.
 - Edición de alimentos registrados con recálculo proporcional por cantidad.
 - Interpretación con IA de descripciones de comidas y desglose de platillos compuestos.
 - Revisión obligatoria de cada coincidencia antes de registrar nutrientes.
@@ -28,15 +30,16 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 
 ## 1. Actualizar la base de datos
 
-### Proyecto que ya tiene V0.6
+### Proyecto que ya tiene V0.8.1
 
 En Supabase **SQL Editor**, copia y ejecuta una sola vez:
 
 ```text
-supabase_v07_ai_recipes_migration.sql
+supabase_v08_2_timezone_migration.sql
 ```
 
-La migración crea `meal_templates` y `meal_template_items` con RLS. Conserva pacientes, mediciones, catálogo y registros existentes.
+La migración agrega la zona horaria a cada cuenta y permite que el propio usuario
+la actualice. Conserva pacientes, mediciones, catálogo y registros existentes.
 
 ### Instalación nueva
 
@@ -47,6 +50,10 @@ Ejecuta en este orden:
 3. `supabase_v05_measurements_goals_migration.sql`
 4. `supabase_v06_experience_tracking_migration.sql`
 5. `supabase_v07_ai_recipes_migration.sql`
+6. `supabase_v08_2_timezone_migration.sql`
+
+Después de iniciar sesión abre **Configuración** en la barra lateral. La zona
+inicial es **Chihuahua** y cada usuario puede elegir otra región compatible.
 
 ## 2. Configurar Supabase Auth
 

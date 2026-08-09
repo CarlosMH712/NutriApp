@@ -50,6 +50,7 @@ create table if not exists public.profiles (
     full_name text not null,
     patient_id uuid unique references public.patients(id) on delete set null,
     invite_code text not null unique default upper(encode(gen_random_bytes(5), 'hex')),
+    timezone text not null default 'America/Chihuahua',
     created_at timestamptz not null default now()
 );
 
@@ -323,6 +324,7 @@ revoke all on function public.attach_legacy_patient(text, uuid) from public, ano
 
 grant usage on schema public to authenticated;
 grant select on public.profiles to authenticated;
+grant update(timezone) on public.profiles to authenticated;
 grant select, update on public.patients to authenticated;
 grant select, insert, update on public.goals to authenticated;
 grant select, insert, update, delete on public.food_log to authenticated;
@@ -339,6 +341,12 @@ drop policy if exists "profiles_select_allowed" on public.profiles;
 create policy "profiles_select_allowed"
 on public.profiles for select to authenticated
 using ((select private.can_view_profile(id)));
+
+drop policy if exists "profiles_update_own_timezone" on public.profiles;
+create policy "profiles_update_own_timezone"
+on public.profiles for update to authenticated
+using ((select auth.uid()) = id)
+with check ((select auth.uid()) = id);
 
 drop policy if exists "patients_select_allowed" on public.patients;
 create policy "patients_select_allowed"

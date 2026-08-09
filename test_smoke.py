@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +36,50 @@ class AppSmokeTests(unittest.TestCase):
         app = AppTest.from_file(str(APP_FILE)).run(timeout=20)
         self.assertEqual(len(app.exception), 0)
         self.assertEqual([tab.label for tab in app.tabs], ["Iniciar sesión", "Crear cuenta"])
+
+    def test_patient_can_save_timezone_and_uses_local_date(self) -> None:
+        auth, profile, goals = self.patient_context()
+        auth["timezone"] = "America/Chihuahua"
+        empty_log = pd.DataFrame(
+            columns=[
+                "id", "log_date", "meal", "food", "quantity", "unit",
+                "calories", "protein", "carbs", "fat", "fiber", "water",
+                "source_name", "source_id",
+            ]
+        )
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.get_profile", return_value=profile))
+            stack.enter_context(patch("db.get_goals", return_value=goals))
+            stack.enter_context(patch("db.get_day_log", return_value=empty_log))
+            stack.enter_context(
+                patch("app_timezone.local_today", return_value=date(2026, 8, 8))
+            )
+            update_timezone = stack.enter_context(
+                patch("db.update_account_timezone")
+            )
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+
+            selected_date = next(
+                widget for widget in app.date_input if widget.label == "Fecha"
+            )
+            self.assertEqual(selected_date.value, date(2026, 8, 8))
+            timezone_select = next(
+                widget for widget in app.selectbox
+                if widget.label == "Zona horaria"
+            )
+            timezone_select.set_value("Ciudad de México")
+            next(
+                button for button in app.button
+                if button.label == "Guardar zona horaria"
+            ).click().run(timeout=20)
+
+        self.assertEqual(len(app.exception), 0)
+        update_timezone.assert_called_once_with(
+            "user-1", "America/Mexico_City"
+        )
 
     def test_patient_catalog_calculates_default_100g(self) -> None:
         empty_log = pd.DataFrame(

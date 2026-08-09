@@ -7,6 +7,8 @@ import pandas as pd
 import streamlit as st
 from supabase import Client, create_client
 
+from app_timezone import DEFAULT_TIMEZONE, normalize_timezone
+
 
 AUTH_STATE_KEYS = (
     "access_token",
@@ -128,16 +130,40 @@ def get_auth_context() -> dict[str, Any]:
         clear_auth_session()
         raise AuthenticationError("No se encontró el usuario autenticado.")
 
-    response = (
-        client.table("profiles")
-        .select("id,role,full_name,patient_id,invite_code")
-        .eq("id", str(user.id))
-        .single()
-        .execute()
-    )
+    profile_fields = "id,role,full_name,patient_id,invite_code"
+    try:
+        response = (
+            client.table("profiles")
+            .select(f"{profile_fields},timezone")
+            .eq("id", str(user.id))
+            .single()
+            .execute()
+        )
+    except Exception:
+        # Mantiene el acceso mientras se ejecuta la migración V0.8.2.
+        response = (
+            client.table("profiles")
+            .select(profile_fields)
+            .eq("id", str(user.id))
+            .single()
+            .execute()
+        )
     profile = dict(response.data)
+    profile["timezone"] = normalize_timezone(
+        profile.get("timezone", DEFAULT_TIMEZONE)
+    )
     profile["email"] = str(user.email or "")
     return profile
+
+
+def update_account_timezone(user_id: str, timezone_name: str) -> None:
+    (
+        get_supabase()
+        .table("profiles")
+        .update({"timezone": normalize_timezone(timezone_name)})
+        .eq("id", user_id)
+        .execute()
+    )
 
 
 def get_profile(patient_id: str) -> dict[str, Any]:
