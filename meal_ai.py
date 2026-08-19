@@ -90,6 +90,11 @@ def _config() -> tuple[str, str]:
     return api_key, model or DEFAULT_GEMINI_MODEL
 
 
+def gemini_client_config() -> tuple[str, str]:
+    """Clave y modelo de Gemini, para los módulos que también los necesitan."""
+    return _config()
+
+
 def gemini_configured() -> bool:
     try:
         _config()
