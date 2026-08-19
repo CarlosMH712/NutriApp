@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import date
-from difflib import SequenceMatcher
-import re
-import unicodedata
 
 import streamlit as st
 
+from food_matching import (
+    match_score,
+    normalize,
+    rank_by_relevance,
+    search_terms,
+)
 from db import (
     create_meal_template,
     delete_meal_template,
@@ -34,27 +37,17 @@ MEALS = ["Desayuno", "Comida", "Cena", "Snack"]
 NUTRIENT_FIELDS = ["calories", "protein", "carbs", "fat", "fiber", "water"]
 
 
+# Debajo de esta puntuación, la mejor coincidencia del catálogo no se parece
+# lo suficiente y conviene consultar además la fuente externa.
+WEAK_MATCH_SCORE = 0.62
+
+
 def _normalize(value: object) -> str:
-    text = unicodedata.normalize("NFD", str(value or "").lower())
-    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
-    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return normalize(value)
 
 
 def _match_score(query: str, candidate: str) -> float:
-    left = _normalize(query)
-    right = _normalize(candidate)
-    if not left or not right:
-        return 0.0
-    if left == right:
-        return 1.0
-    if left in right or right in left:
-        containment = min(len(left), len(right)) / max(len(left), len(right))
-        return 0.88 + 0.1 * containment
-    left_tokens = set(left.split())
-    right_tokens = set(right.split())
-    overlap = len(left_tokens & right_tokens) / max(len(left_tokens | right_tokens), 1)
-    sequence = SequenceMatcher(None, left, right).ratio()
-    return 0.55 * sequence + 0.45 * overlap
+    return match_score(query, candidate)
 
 
 def rank_catalog_matches(
@@ -65,45 +58,29 @@ def rank_catalog_matches(
         key = str(candidate.get("result_key") or candidate.get("catalog_food_id") or "")
         if key:
             unique[key] = candidate
-    ranked = [
-        {
-            **item,
-            "match_score": _match_score(query, str(item.get("name") or "")),
-        }
-        for item in unique.values()
-    ]
-    return sorted(
-        ranked,
-        key=lambda item: float(item.get("match_score") or 0),
-        reverse=True,
-    )[:limit]
+    return rank_by_relevance(query, list(unique.values()), limit)
 
 
 def _catalog_candidates(query: str) -> list[dict]:
     candidates: list[dict] = []
-    search_terms = [query]
-    ignored = {"con", "sin", "para", "tipo", "de", "del", "la", "el"}
-    search_terms.extend(
-        token for token in _normalize(query).split()
-        if len(token) >= 4 and token not in ignored
-    )
-    seen_terms: set[str] = set()
-    for term in search_terms[:5]:
-        normalized = _normalize(term)
-        if not normalized or normalized in seen_terms:
-            continue
-        seen_terms.add(normalized)
+    for term in search_terms(query):
         try:
             candidates.extend(search_catalog(term, limit=15))
         except Exception:
             continue
 
-    if not candidates and food_data_central_configured():
+    ranked = rank_catalog_matches(query, candidates)
+    # Antes el respaldo externo sólo se consultaba con la lista vacía. Bastaba
+    # que una palabra suelta trajera resultados irrelevantes para bloquearlo:
+    # "carne de res" se llenaba de otras carnes y nunca llegaba a la correcta.
+    best_score = float(ranked[0].get("match_score") or 0) if ranked else 0.0
+    if best_score < WEAK_MATCH_SCORE and food_data_central_configured():
         try:
             candidates.extend(search_food_data_central(query, limit=8))
         except FoodSourceError:
             pass
-    return rank_catalog_matches(query, candidates)
+        ranked = rank_catalog_matches(query, candidates)
+    return ranked
 
 
 def _food_label(food: dict) -> str:
@@ -183,7 +160,7 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
             max_chars=2000,
         )
         interpret_submitted = st.form_submit_button(
-            "✨ Interpretar platillo", use_container_width=True
+            "✨ Interpretar platillo", width="stretch"
         )
 
     if interpret_submitted:
@@ -256,15 +233,24 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
                 format_func=_food_label,
                 key=f"ai_match_{run_id}_{index}",
             )
-            portion_name = str(selected_food.get("portion_name") or "").strip()
             units = measurement_options(selected_food, item.get("unit"))
             parsed_volume_ml = volume_ml_from_quantity(
                 float(item.get("quantity") or 0), item.get("unit")
             )
-            if portion_name in units and _portion_matches(
-                str(item.get("unit") or ""), portion_name
-            ):
-                default_unit_index = units.index(portion_name)
+            # Se busca entre todas las medidas del alimento la que corresponde a
+            # la unidad que dijo el usuario: "una taza" debe preseleccionar taza
+            # aunque el alimento tenga además pieza y cucharada.
+            matching_unit = next(
+                (
+                    unit
+                    for unit in units
+                    if unit not in {GRAMS, MILLILITERS}
+                    and _portion_matches(str(item.get("unit") or ""), unit)
+                ),
+                None,
+            )
+            if matching_unit is not None:
+                default_unit_index = units.index(matching_unit)
             elif parsed_volume_ml is not None and MILLILITERS in units:
                 default_unit_index = units.index(MILLILITERS)
             else:
@@ -357,7 +343,7 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
     register_disabled = not confirmed_items or bool(unresolved_items)
     if st.button(
         "✅ Confirmar y registrar componentes",
-        use_container_width=True,
+        width="stretch",
         disabled=register_disabled,
         key=f"ai_confirm_{run_id}",
     ):
@@ -437,7 +423,7 @@ def render_saved_meals(patient_id: str, selected_date: date) -> None:
             )
             if st.button(
                 "Registrar platillo", key=f"register_template_{template['id']}",
-                use_container_width=True,
+                width="stretch",
             ):
                 try:
                     save_food_entries(patient_id, selected_date, meal, scaled_items)
@@ -492,7 +478,7 @@ def render_recipe_admin() -> None:
         st.caption(
             f"{preview['grams']:.1f} g · {preview['calories']:.0f} kcal"
         )
-        if st.button("Agregar componente", use_container_width=True):
+        if st.button("Agregar componente", width="stretch"):
             draft.append(preview)
             st.session_state["recipe_draft_items"] = draft
             st.rerun()
@@ -518,7 +504,7 @@ def render_recipe_admin() -> None:
         recipe_name = st.text_input("Nombre de la receta")
         default_meal = st.selectbox("Tiempo de comida sugerido", MEALS, index=1)
         save_recipe = st.form_submit_button(
-            "Guardar receta para mis pacientes", use_container_width=True,
+            "Guardar receta para mis pacientes", width="stretch",
             disabled=not draft,
         )
     if save_recipe:

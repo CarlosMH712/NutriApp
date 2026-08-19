@@ -368,5 +368,137 @@ class AppSmokeTests(unittest.TestCase):
         self.assertIn("🍲 Recetas del nutriólogo", [title.value for title in app.title])
 
 
+    @staticmethod
+    def empty_food_log() -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "id", "log_date", "meal", "food", "quantity", "unit",
+                "calories", "protein", "carbs", "fat", "fiber", "water",
+                "source_name", "source_id",
+            ]
+        )
+
+    @staticmethod
+    def nutritionist_context() -> tuple[dict, dict, dict]:
+        # patient_id deja de ser None: la V0.9 conserva el expediente propio
+        # del nutriólogo al promoverlo.
+        auth = {
+            "id": "nutritionist-1", "role": "nutritionist",
+            "full_name": "Nutrióloga prueba", "patient_id": "nutritionist-1",
+            "invite_code": "NUTRI123", "email": "nutritionist@example.com",
+            "timezone": "America/Chihuahua",
+        }
+        own_profile = {
+            "id": "nutritionist-1", "name": "Nutrióloga prueba", "age": 38,
+            "sex": "Femenino", "weight": 62, "height": 165,
+            "activity_level": "Moderada",
+        }
+        goals = {
+            "patient_id": "nutritionist-1", "calories": 1900, "protein": 110,
+            "carbs": 210, "fat": 60, "fiber": 28, "water": 2300,
+            "calculation_method": None, "resting_calories": None,
+            "activity_factor": None, "calorie_adjustment_pct": None,
+            "protein_pct": None, "carbs_pct": None, "fat_pct": None,
+            "water_ml_per_kg": None,
+        }
+        return auth, own_profile, goals
+
+    def test_nutritionist_can_track_herself(self) -> None:
+        """Antes tenía que abrir una segunda cuenta para registrar su comida."""
+        auth, own_profile, goals = self.nutritionist_context()
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.list_assigned_patients", return_value=[]))
+            stack.enter_context(patch("db.get_profile", return_value=own_profile))
+            stack.enter_context(patch("db.get_goals", return_value=goals))
+            stack.enter_context(patch("db.get_day_log", return_value=self.empty_food_log()))
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+
+            self.assertEqual(len(app.exception), 0)
+            record_select = next(
+                widget for widget in app.sidebar.selectbox
+                if widget.label == "Expediente"
+            )
+            self.assertIn("👤 Mi propio seguimiento", record_select.options)
+            self.assertIn("➕ Registrar", app.sidebar.radio[0].options)
+
+    def test_nutritionist_registering_for_a_patient_has_no_register_page(self) -> None:
+        auth, own_profile, goals = self.nutritionist_context()
+        patient = {
+            "id": "patient-1", "name": "Paciente prueba", "age": 33,
+            "sex": "Masculino", "weight": 84, "height": 170,
+            "activity_level": "Moderada",
+        }
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.list_assigned_patients", return_value=[patient]))
+            stack.enter_context(patch("db.get_profile", return_value=own_profile))
+            stack.enter_context(patch("db.get_goals", return_value=goals))
+            stack.enter_context(patch("db.get_day_log", return_value=self.empty_food_log()))
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+            record_select = next(
+                widget for widget in app.sidebar.selectbox
+                if widget.label == "Expediente"
+            )
+            patient_option = next(
+                option for option in record_select.options
+                if option.startswith("Paciente prueba")
+            )
+            record_select.set_value(patient_option).run(timeout=20)
+
+            self.assertEqual(len(app.exception), 0)
+            # El registro de alimentos lo hace el paciente, no el profesional.
+            self.assertNotIn("➕ Registrar", app.sidebar.radio[0].options)
+
+    def test_patient_can_log_on_a_past_day_from_the_page(self) -> None:
+        """El selector vivía sólo en la barra lateral, oculta en el teléfono."""
+        auth, profile, goals = self.patient_context()
+        auth["timezone"] = "America/Chihuahua"
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.get_profile", return_value=profile))
+            stack.enter_context(patch("db.get_goals", return_value=goals))
+            stack.enter_context(patch("db.get_day_log", return_value=self.empty_food_log()))
+            stack.enter_context(
+                patch("app_timezone.local_today", return_value=date(2026, 8, 8))
+            )
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+
+            next(
+                button for button in app.button if button.label == "Ayer"
+            ).click().run(timeout=20)
+
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(
+                app.session_state["selected_log_date"], date(2026, 8, 7)
+            )
+
+    def test_register_page_offers_activity(self) -> None:
+        auth, profile, goals = self.patient_context()
+        auth["timezone"] = "America/Chihuahua"
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.get_profile", return_value=profile))
+            stack.enter_context(patch("db.get_goals", return_value=goals))
+            stack.enter_context(patch("db.get_day_log", return_value=self.empty_food_log()))
+            stack.enter_context(patch("db.get_activity_day", return_value={}))
+            stack.enter_context(
+                patch("db.get_exercise_log", return_value=pd.DataFrame())
+            )
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+            app.sidebar.radio[0].set_value("➕ Registrar").run(timeout=20)
+
+            self.assertEqual(len(app.exception), 0)
+            self.assertIn("🏃 Actividad", [tab.label for tab in app.tabs])
+
+
 if __name__ == "__main__":
     unittest.main()

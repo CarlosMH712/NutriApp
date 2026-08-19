@@ -92,23 +92,54 @@ def effective_water_ml(
     return stored
 
 
+def food_portions(food: dict) -> list[dict]:
+    """Devuelve las medidas caseras de un alimento como [{name, grams}].
+
+    Acepta la lista de `food_catalog_portions` y también la porción única que
+    guardaban las versiones anteriores, para que los alimentos importados y los
+    resultados de USDA sigan funcionando sin volver a capturarse.
+    """
+    portions: list[dict] = []
+    seen: set[str] = set()
+
+    def add(name: object, grams: object) -> None:
+        clean_name = str(name or "").strip()
+        clean_grams = _nonnegative_number(grams)
+        key = normalize_measurement_text(clean_name)
+        if clean_name and clean_grams > 0 and key and key not in seen:
+            seen.add(key)
+            portions.append({"name": clean_name, "grams": clean_grams})
+
+    for item in food.get("portions") or []:
+        if isinstance(item, dict):
+            add(
+                item.get("portion_name") or item.get("name"),
+                item.get("grams") if item.get("grams") is not None else item.get("portion_grams"),
+            )
+    add(food.get("portion_name"), food.get("portion_grams"))
+    return portions
+
+
 def is_liquid_food(food: dict, hinted_unit: object = "") -> bool:
+    # La marca explícita del catálogo tiene prioridad: la detección por nombre
+    # falla con líquidos que no se llaman agua, leche o jugo.
+    if bool(food.get("is_liquid")):
+        return True
     name_tokens = set(normalize_measurement_text(food.get("name")).split())
-    portion_name = normalize_measurement_text(food.get("portion_name"))
     hint = normalize_measurement_text(hinted_unit)
     if name_tokens.intersection(LIQUID_NAME_TERMS):
         return True
-    if portion_name in LIQUID_PORTION_TERMS:
-        return True
+    for portion in food_portions(food):
+        if normalize_measurement_text(portion["name"]) in LIQUID_PORTION_TERMS:
+            return True
     return hint in LIQUID_PORTION_TERMS
 
 
 def measurement_options(food: dict, hinted_unit: object = "") -> list[str]:
     options = [MILLILITERS, GRAMS] if is_liquid_food(food, hinted_unit) else [GRAMS]
-    portion_name = str(food.get("portion_name") or "").strip()
-    portion_grams = float(food.get("portion_grams") or 0)
-    if portion_name and portion_grams > 0 and portion_name not in options:
-        options.append(portion_name)
+    for portion in food_portions(food):
+        if portion["name"] not in options:
+            options.append(portion["name"])
     return options
 
 
@@ -117,8 +148,6 @@ def calculate_food_serving(food: dict, amount: float, unit_choice: str) -> dict:
     if quantity <= 0:
         raise ValueError("La cantidad debe ser mayor que cero.")
 
-    portion_name = str(food.get("portion_name") or "").strip()
-    portion_grams = float(food.get("portion_grams") or 0)
     normalized_unit = normalize_measurement_text(unit_choice)
     if normalized_unit in {"g", "gramo", "gramos"}:
         grams = quantity
@@ -128,11 +157,19 @@ def calculate_food_serving(food: dict, amount: float, unit_choice: str) -> dict:
         # los líquidos se aproximan como 1 ml = 1 g y se muestran para revisión.
         grams = quantity
         saved_unit = "ml"
-    elif portion_name and portion_grams > 0:
-        grams = quantity * portion_grams
-        saved_unit = portion_name
     else:
-        raise ValueError("La porción seleccionada no tiene equivalencia en gramos.")
+        matched = next(
+            (
+                portion
+                for portion in food_portions(food)
+                if normalize_measurement_text(portion["name"]) == normalized_unit
+            ),
+            None,
+        )
+        if matched is None:
+            raise ValueError("La porción seleccionada no tiene equivalencia en gramos.")
+        grams = quantity * matched["grams"]
+        saved_unit = matched["name"]
 
     factor = grams / 100.0
     values = {
