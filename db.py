@@ -8,6 +8,7 @@ import streamlit as st
 from supabase import Client, create_client
 
 from app_timezone import DEFAULT_TIMEZONE, normalize_timezone
+from food_matching import rank_by_relevance
 
 
 AUTH_STATE_KEYS = (
@@ -580,25 +581,13 @@ def update_food(
 
 def get_history(patient_id: str) -> pd.DataFrame:
     """Fetch raw rows with pagination; aggregation is performed in pandas."""
-    db = get_supabase()
-    page_size = 1000
-    start = 0
-    rows: list[dict[str, Any]] = []
-
-    while True:
-        response = (
-            db.table("food_log")
-            .select("log_date,food,quantity,unit,calories,protein,carbs,fat,fiber,water")
-            .eq("patient_id", patient_id)
-            .order("log_date")
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-        batch = response.data or []
-        rows.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
+    rows = _fetch_all(
+        lambda: get_supabase()
+        .table("food_log")
+        .select("log_date,food,quantity,unit,calories,protein,carbs,fat,fiber,water")
+        .eq("patient_id", patient_id)
+        .order("log_date")
+    )
 
     columns = [
         "log_date",
@@ -650,11 +639,28 @@ def link_nutritionist(invite_code: str) -> None:
 
 
 CATALOG_COLUMNS = (
-    "id,name,brand,source,external_id,created_by,verified,"
+    "id,name,brand,source,external_id,created_by,verified,is_liquid,"
     "calories_per_100g,protein_per_100g,carbs_per_100g,"
     "fat_per_100g,fiber_per_100g,water_per_100g,"
     "portion_name,portion_grams"
 )
+
+# PostgREST devuelve como máximo 1000 filas por consulta. Cualquier lectura que
+# pueda superar ese número debe pedir páginas hasta agotar el resultado.
+PAGE_SIZE = 1000
+
+
+def _fetch_all(build_query: Any) -> list[dict[str, Any]]:
+    """Recorre todas las páginas de una consulta hasta agotarla."""
+    rows: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        response = build_query().range(start, start + PAGE_SIZE - 1).execute()
+        batch = response.data or []
+        rows.extend(dict(row) for row in batch)
+        if len(batch) < PAGE_SIZE:
+            return rows
+        start += PAGE_SIZE
 
 
 def _catalog_result(row: dict[str, Any]) -> dict[str, Any]:
@@ -665,35 +671,140 @@ def _catalog_result(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _attach_portions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Agrega a cada alimento sus medidas caseras en una sola consulta."""
+    food_ids = [str(row["id"]) for row in rows if row.get("id")]
+    if not food_ids:
+        return rows
+    portions_by_food: dict[str, list[dict[str, Any]]] = {}
+    try:
+        for chunk_start in range(0, len(food_ids), 200):
+            chunk = food_ids[chunk_start : chunk_start + 200]
+            response = (
+                get_supabase()
+                .table("food_catalog_portions")
+                .select("id,food_id,portion_name,grams,position")
+                .in_("food_id", chunk)
+                .order("position")
+                .execute()
+            )
+            for portion in response.data or []:
+                portions_by_food.setdefault(str(portion["food_id"]), []).append(
+                    dict(portion)
+                )
+    except Exception:
+        # Si la migración V0.9 aún no se ejecuta, el alimento conserva la
+        # porción única de la versión anterior y la app sigue funcionando.
+        return rows
+    for row in rows:
+        row["portions"] = portions_by_food.get(str(row.get("id")), [])
+    return rows
+
+
 def search_catalog(query: str, limit: int = 25) -> list[dict[str, Any]]:
     clean_query = query.strip().replace("%", "").replace("_", "")
     if not clean_query:
         return []
+    # Se traen más candidatos de los que se muestran y se ordenan por parecido.
+    # Ordenar por nombre y cortar devolvía sólo los primeros alfabéticamente:
+    # buscar "carne" se llenaba de "carne de cerdo" y nunca llegaba a la de res.
+    pool = min(max(int(limit) * 12, 120), 400)
     response = (
         get_supabase()
         .table("food_catalog")
         .select(CATALOG_COLUMNS)
         .ilike("name", f"%{clean_query}%")
         .order("name")
-        .limit(min(max(int(limit), 1), 50))
+        .limit(pool)
         .execute()
     )
-    return [_catalog_result(dict(row)) for row in (response.data or [])]
+    ranked = rank_by_relevance(
+        clean_query, [dict(row) for row in (response.data or [])], limit
+    )
+    return [_catalog_result(row) for row in _attach_portions(ranked)]
 
 
-def list_owned_catalog() -> list[dict[str, Any]]:
+def list_owned_catalog(
+    query: str = "", limit: int | None = None, offset: int = 0
+) -> list[dict[str, Any]]:
+    """Catálogo propio del nutriólogo, filtrado y por páginas.
+
+    Con `limit` se pide una sola página; sin él se recorre la tabla completa.
+    Sin paginar, PostgREST cortaba en 1000 filas y con un catálogo importado de
+    casi 1900 alimentos sólo se alcanzaban a ver los primeros alfabéticamente.
+    """
     user_id = str(st.session_state.get("auth_user_id") or "")
     if not user_id:
         raise AuthenticationError("No se encontró el usuario autenticado.")
-    response = (
+    clean_query = query.strip().replace("%", "").replace("_", "")
+
+    def build_query() -> Any:
+        request = (
+            get_supabase()
+            .table("food_catalog")
+            .select(CATALOG_COLUMNS)
+            .eq("created_by", user_id)
+        )
+        if clean_query:
+            request = request.ilike("name", f"%{clean_query}%")
+        return request.order("name")
+
+    if limit is None:
+        rows = _fetch_all(build_query)
+    else:
+        start = max(int(offset), 0)
+        response = (
+            build_query().range(start, start + max(int(limit), 1) - 1).execute()
+        )
+        rows = [dict(row) for row in (response.data or [])]
+    return [_catalog_result(row) for row in _attach_portions(rows)]
+
+
+def count_owned_catalog(query: str = "") -> int:
+    """Total real de alimentos propios, sin traerlos todos."""
+    user_id = str(st.session_state.get("auth_user_id") or "")
+    if not user_id:
+        raise AuthenticationError("No se encontró el usuario autenticado.")
+    clean_query = query.strip().replace("%", "").replace("_", "")
+    request = (
         get_supabase()
         .table("food_catalog")
-        .select(CATALOG_COLUMNS)
+        .select("id", count="exact")
         .eq("created_by", user_id)
-        .order("name")
+    )
+    if clean_query:
+        request = request.ilike("name", f"%{clean_query}%")
+    response = request.limit(1).execute()
+    return int(response.count or 0)
+
+
+def add_catalog_portion(food_id: str, portion_name: str, grams: float) -> str:
+    response = (
+        get_supabase()
+        .rpc(
+            "add_catalog_portion",
+            {
+                "p_food_id": food_id,
+                "p_portion_name": portion_name.strip(),
+                "p_grams": float(grams),
+            },
+        )
         .execute()
     )
-    return [_catalog_result(dict(row)) for row in (response.data or [])]
+    return str(response.data)
+
+
+def delete_catalog_portion(portion_id: str) -> None:
+    get_supabase().rpc(
+        "delete_catalog_portion", {"p_portion_id": portion_id}
+    ).execute()
+
+
+def set_catalog_food_liquid(food_id: str, is_liquid: bool) -> None:
+    get_supabase().rpc(
+        "set_catalog_food_liquid",
+        {"p_food_id": food_id, "p_is_liquid": bool(is_liquid)},
+    ).execute()
 
 
 def create_catalog_food(
@@ -836,3 +947,190 @@ def delete_meal_template(template_id: str) -> None:
     get_supabase().rpc(
         "delete_meal_template", {"p_template_id": template_id}
     ).execute()
+
+
+# ---------------------------------------------------------------------------
+# Actividad física
+# ---------------------------------------------------------------------------
+
+ACTIVITY_DAY_COLUMNS = (
+    "id,log_date,steps,active_calories,resting_calories,distance_km,source,notes"
+)
+EXERCISE_COLUMNS = (
+    "id,log_date,exercise,duration_minutes,intensity,calories,source,notes"
+)
+
+
+def get_activity_days(patient_id: str) -> pd.DataFrame:
+    """Resumen diario de actividad, completo y ordenado por fecha."""
+    rows = _fetch_all(
+        lambda: get_supabase()
+        .table("activity_days")
+        .select(ACTIVITY_DAY_COLUMNS)
+        .eq("patient_id", patient_id)
+        .order("log_date")
+    )
+    columns = [
+        "id", "log_date", "steps", "active_calories",
+        "resting_calories", "distance_km", "source", "notes",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def get_activity_day(patient_id: str, selected_date: date) -> dict[str, Any]:
+    response = (
+        get_supabase()
+        .table("activity_days")
+        .select(ACTIVITY_DAY_COLUMNS)
+        .eq("patient_id", patient_id)
+        .eq("log_date", selected_date.isoformat())
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return dict(rows[0]) if rows else {}
+
+
+def save_activity_day(
+    patient_id: str,
+    selected_date: date,
+    steps: int | None = None,
+    active_calories: float | None = None,
+    resting_calories: float | None = None,
+    distance_km: float | None = None,
+    notes: str = "",
+    source: str = "manual",
+) -> None:
+    """Crea o reemplaza el resumen del día. Hay uno solo por paciente y fecha."""
+    payload = {
+        "patient_id": patient_id,
+        "log_date": selected_date.isoformat(),
+        "steps": int(steps) if steps is not None else None,
+        "active_calories": float(active_calories) if active_calories is not None else None,
+        "resting_calories": (
+            float(resting_calories) if resting_calories is not None else None
+        ),
+        "distance_km": float(distance_km) if distance_km is not None else None,
+        "notes": notes.strip() or None,
+        "source": source,
+        "updated_at": "now()",
+    }
+    (
+        get_supabase()
+        .table("activity_days")
+        .upsert(payload, on_conflict="patient_id,log_date")
+        .execute()
+    )
+
+
+def import_activity_days(patient_id: str, rows: list[dict[str, Any]]) -> int:
+    """Alta masiva del resumen diario, usada por la importación de Salud."""
+    if not rows:
+        return 0
+    if len(rows) > 2000:
+        raise ValueError("Importa un máximo de 2000 días por archivo.")
+    payload = [
+        {
+            "patient_id": patient_id,
+            "log_date": str(row["log_date"]),
+            "steps": int(row["steps"]) if row.get("steps") is not None else None,
+            "active_calories": (
+                float(row["active_calories"])
+                if row.get("active_calories") is not None
+                else None
+            ),
+            "distance_km": (
+                float(row["distance_km"]) if row.get("distance_km") is not None else None
+            ),
+            "source": "apple_health",
+            "updated_at": "now()",
+        }
+        for row in rows
+    ]
+    for chunk_start in range(0, len(payload), 500):
+        (
+            get_supabase()
+            .table("activity_days")
+            .upsert(
+                payload[chunk_start : chunk_start + 500],
+                on_conflict="patient_id,log_date",
+            )
+            .execute()
+        )
+    return len(payload)
+
+
+def delete_activity_day(patient_id: str, selected_date: date) -> None:
+    (
+        get_supabase()
+        .table("activity_days")
+        .delete()
+        .eq("patient_id", patient_id)
+        .eq("log_date", selected_date.isoformat())
+        .execute()
+    )
+
+
+def get_exercise_log(
+    patient_id: str, selected_date: date | None = None
+) -> pd.DataFrame:
+    def build_query() -> Any:
+        request = (
+            get_supabase()
+            .table("exercise_log")
+            .select(EXERCISE_COLUMNS)
+            .eq("patient_id", patient_id)
+        )
+        if selected_date is not None:
+            request = request.eq("log_date", selected_date.isoformat())
+        return request.order("log_date")
+
+    rows = _fetch_all(build_query)
+    columns = [
+        "id", "log_date", "exercise", "duration_minutes",
+        "intensity", "calories", "source", "notes",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def save_exercise(
+    patient_id: str,
+    selected_date: date,
+    exercise: str,
+    duration_minutes: float | None = None,
+    intensity: str | None = None,
+    calories: float | None = None,
+    notes: str = "",
+) -> None:
+    clean_exercise = exercise.strip()
+    if not clean_exercise:
+        raise ValueError("Escribe el nombre del ejercicio.")
+    (
+        get_supabase()
+        .table("exercise_log")
+        .insert(
+            {
+                "patient_id": patient_id,
+                "log_date": selected_date.isoformat(),
+                "exercise": clean_exercise,
+                "duration_minutes": (
+                    float(duration_minutes) if duration_minutes else None
+                ),
+                "intensity": intensity or None,
+                "calories": float(calories) if calories else None,
+                "notes": notes.strip() or None,
+            }
+        )
+        .execute()
+    )
+
+
+def delete_exercise(exercise_id: int, patient_id: str) -> None:
+    (
+        get_supabase()
+        .table("exercise_log")
+        .delete()
+        .eq("id", int(exercise_id))
+        .eq("patient_id", patient_id)
+        .execute()
+    )

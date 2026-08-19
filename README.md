@@ -1,4 +1,4 @@
-# 🥗 Mi Nutrición — V0.8.2 zona horaria y gráficas estables
+# 🥗 Mi Nutrición — V0.9 medidas, actividad y autoseguimiento
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
@@ -27,19 +27,29 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 - Corrección y eliminación confirmada de mediciones corporales.
 - Registro manual disponible cuando el alimento no existe en el catálogo.
 - Trazabilidad de la fuente e identificador de cada alimento registrado.
+- Catálogo propio con buscador y páginas, sin el tope de mil alimentos.
+- Varias medidas caseras por alimento: taza, pieza, cucharada y las que se definan.
+- Marca explícita de líquido para habilitar el registro en mililitros.
+- Selector de fecha dentro de la página, con accesos directos a hoy y ayer.
+- Registro de actividad física: pasos, calorías activas, distancia y ejercicios.
+- Importación del archivo de exportación de la app Salud del iPhone.
+- Gráficas de actividad y comparación del consumo contra las calorías quemadas.
+- El nutriólogo lleva su propio seguimiento desde su misma cuenta.
 
 ## 1. Actualizar la base de datos
 
-### Proyecto que ya tiene V0.8.1
+### Proyecto que ya tiene V0.8.2
 
 En Supabase **SQL Editor**, copia y ejecuta una sola vez:
 
 ```text
-supabase_v08_2_timezone_migration.sql
+supabase_v09_portions_activity_selftracking_migration.sql
 ```
 
-La migración agrega la zona horaria a cada cuenta y permite que el propio usuario
-la actualice. Conserva pacientes, mediciones, catálogo y registros existentes.
+Después ejecuta `select public.repair_nutritionist_self_tracking();` para que las
+cuentas de nutriólogo recuperen su expediente propio. Los detalles están en
+`GUIA_SUBIDA_V09.md`. La migración conserva pacientes, mediciones, catálogo y
+registros existentes.
 
 ### Instalación nueva
 
@@ -51,6 +61,7 @@ Ejecuta en este orden:
 4. `supabase_v06_experience_tracking_migration.sql`
 5. `supabase_v07_ai_recipes_migration.sql`
 6. `supabase_v08_2_timezone_migration.sql`
+7. `supabase_v09_portions_activity_selftracking_migration.sql`
 
 Después de iniciar sesión abre **Configuración** en la barra lateral. La zona
 inicial es **Chihuahua** y cada usuario puede elegir otra región compatible.
@@ -112,14 +123,24 @@ select public.promote_user_to_nutritionist('nutriologa@ejemplo.com');
 
 El resultado es el código que el nutriólogo comparte con sus pacientes.
 
+La cuenta conserva además su propio expediente. En la barra lateral, el
+selector **Expediente** ofrece **👤 Mi propio seguimiento** junto a sus
+pacientes, de modo que puede registrar su alimentación sin abrir otra cuenta.
+
 ## 5. Administrar el catálogo
 
 El nutriólogo encontrará **Catálogo** en la barra lateral. Puede:
 
 - crear un alimento con valores por 100 g;
-- definir una porción casera y sus gramos;
+- definir todas las medidas caseras que necesite y sus gramos equivalentes;
+- marcar un alimento como líquido para habilitar los mililitros;
 - importar hasta 2000 filas desde CSV;
+- buscar entre sus alimentos y recorrerlos por páginas;
 - consultar y eliminar sus propios alimentos.
+
+Las medidas se administran en **Mis alimentos**: al abrir un alimento aparecen
+las que ya tiene y un formulario para agregar otra. Un mismo alimento puede
+ofrecerse en gramos, taza y pieza al mismo tiempo.
 
 La pantalla de importación incluye una plantilla descargable. Columnas:
 
@@ -184,7 +205,34 @@ Estas fórmulas son estimaciones para adultos y no sustituyen la evaluación pro
 - Las recetas del nutriólogo están disponibles para todos sus pacientes vinculados.
 - Una receta puede registrarse en 0.25, 0.5, 1 o más porciones.
 
-## 10. Ejecutar localmente
+## 10. Actividad física
+
+El paciente registra su actividad en **Registrar > Actividad**:
+
+- **Resumen del día:** pasos, calorías activas, calorías en reposo y distancia.
+  Hay un solo resumen por fecha.
+- **Ejercicios:** las sesiones del día, con duración, intensidad y calorías.
+  Pueden ser varias.
+- **Importar de Salud:** el archivo que genera **Salud > foto de perfil >
+  Exportar todos los datos** en el iPhone.
+
+Streamlit no puede leer HealthKit directamente desde el navegador, así que la
+sincronización automática con el Apple Watch no es posible sin una aplicación
+nativa. La importación del archivo es la alternativa disponible.
+
+Cuando el iPhone y el reloj registran la misma caminata, sumar ambas fuentes
+duplicaría los pasos. La importación agrupa por dispositivo y conserva, para
+cada día, el que reporta el total más alto.
+
+El archivo se procesa al subirlo y no se almacena. Sólo se leen pasos, calorías
+activas, distancia y entrenamientos.
+
+En **Historial > Actividad** se ven las gráficas de pasos y calorías activas, el
+resumen de ejercicios y la comparación del consumo contra las calorías quemadas
+en actividad. Esa comparación no incluye el gasto en reposo, así que no
+representa el balance energético total.
+
+## 11. Ejecutar localmente
 
 ```bash
 python3 -m venv .venv
@@ -193,19 +241,35 @@ pip install -r requirements.txt
 python3 -m streamlit run app.py
 ```
 
-## 11. Desplegar
+## 12. Desplegar
 
 Sube el código a GitHub sin `secrets.toml`. Streamlit Community Cloud actualizará la app desde el repositorio. Después verifica que **App settings > Secrets** incluya la configuración de Supabase, Gemini y, opcionalmente, FoodData Central.
 
-## Pruebas recomendadas
+## Pruebas automatizadas
 
-1. Ejecuta la migración V0.4.
-2. Crea un alimento desde la cuenta del nutriólogo.
-3. Confirma que un paciente vinculado pueda encontrarlo.
+El proyecto usa `unittest` de la biblioteca estándar. Desde la raíz:
+
+```bash
+python3 -m unittest discover -s . -p "test_*.py" -t .
+```
+
+Cubren el cálculo de metas y porciones, la coincidencia de nombres del catálogo,
+la paginación de las consultas, la lectura del archivo de Salud y pruebas de
+humo de la interfaz con `streamlit.testing`. No requieren conexión a Supabase.
+
+## Pruebas manuales recomendadas
+
+1. Ejecuta las migraciones pendientes en orden.
+2. Crea un alimento desde la cuenta del nutriólogo y agrégale dos medidas.
+3. Confirma que un paciente vinculado pueda encontrarlo y elegir esas medidas.
 4. Confirma que otro paciente no vinculado no pueda verlo.
 5. Registra 150 g y verifica que los valores correspondan a 1.5 veces los valores por 100 g.
 6. Configura FoodData Central y prueba una búsqueda externa.
 7. Verifica que los registros manuales anteriores sigan visibles.
+8. Registra un alimento en la fecha de ayer y confirma que quede en ese día.
+9. Captura actividad y revisa que aparezca en **Historial > Actividad**.
+
+La lista completa de comprobaciones de esta versión está en `GUIA_SUBIDA_V09.md`.
 
 ## Alcance y privacidad
 

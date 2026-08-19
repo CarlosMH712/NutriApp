@@ -14,10 +14,13 @@ from app_timezone import (
 from db import (
     AuthenticationError,
     DatabaseConfigError,
+    add_catalog_portion,
     clear_auth_session,
+    count_owned_catalog,
     create_catalog_food,
     delete_body_measurement,
     delete_catalog_food,
+    delete_catalog_portion,
     delete_food,
     get_auth_context,
     get_body_measurements,
@@ -33,6 +36,7 @@ from db import (
     save_food,
     save_body_measurement,
     search_catalog,
+    set_catalog_food_liquid,
     sign_in,
     sign_out,
     sign_up,
@@ -53,6 +57,7 @@ from food_measurements import (
     MILLILITERS,
     calculate_food_serving,
     effective_water_ml,
+    food_portions,
     is_plain_water_name,
     measurement_options,
     volume_ml_from_quantity,
@@ -69,9 +74,15 @@ from meal_workflows import (
     render_recipe_admin,
     render_saved_meals,
 )
+from activity_workflows import (
+    render_activity_history,
+    render_activity_register,
+)
 
 
 st.set_page_config(page_title="Mi Nutrición", page_icon="🥗", layout="wide")
+
+SELF_TRACKING_LABEL = "👤 Mi propio seguimiento"
 
 
 def auth_screen() -> dict:
@@ -108,7 +119,7 @@ def auth_screen() -> dict:
                 autocomplete="current-password",
             )
             login_submitted = st.form_submit_button(
-                "Entrar", use_container_width=True
+                "Entrar", width="stretch"
             )
         if login_submitted:
             if not email.strip() or not password:
@@ -144,7 +155,7 @@ def auth_screen() -> dict:
                 autocomplete="new-password",
             )
             register_submitted = st.form_submit_button(
-                "Crear mi cuenta", use_container_width=True
+                "Crear mi cuenta", width="stretch"
             )
         if register_submitted:
             if not full_name.strip() or not new_email.strip():
@@ -304,7 +315,7 @@ def render_food_editor(row: pd.Series, patient_id: str) -> None:
             )
 
         save_edit = st.form_submit_button(
-            "Guardar cambios", use_container_width=True
+            "Guardar cambios", width="stretch"
         )
 
     if save_edit:
@@ -342,9 +353,13 @@ def render_day(
     selected_date: date,
     can_edit: bool,
     can_delete: bool,
+    account_today: date | None = None,
 ) -> None:
     st.title("🥗 Mi día" if can_delete else "🥗 Resumen del paciente")
-    st.caption(selected_date.strftime("%d/%m/%Y"))
+    if account_today is not None:
+        selected_date = render_log_date_controls(account_today)
+    else:
+        st.caption(selected_date.strftime("%d/%m/%Y"))
     if notice := st.session_state.pop("food_update_notice", None):
         st.success(str(notice))
     try:
@@ -466,7 +481,7 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
             placeholder="Ej. huevo, arroz, tortilla o aguacate",
         )
         search_submitted = st.form_submit_button(
-            "🔎 Buscar", use_container_width=True
+            "🔎 Buscar", width="stretch"
         )
 
     if search_submitted:
@@ -518,10 +533,15 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
     )
 
     unit_options = measurement_options(selected_food)
-    portion_name = str(selected_food.get("portion_name") or "").strip()
-    portion_grams = float(selected_food.get("portion_grams") or 0)
-    if portion_name and portion_grams > 0:
-        st.caption(f"Medida casera disponible: 1 {portion_name} = {portion_grams:.1f} g")
+    available_portions = food_portions(selected_food)
+    if available_portions:
+        st.caption(
+            "Medidas caseras disponibles: "
+            + " · ".join(
+                f"1 {portion['name']} = {portion['grams']:.1f} g"
+                for portion in available_portions
+            )
+        )
     if MILLILITERS in unit_options:
         st.caption("Para líquidos, la conversión nutrimental aproxima 1 ml = 1 g.")
 
@@ -556,7 +576,7 @@ def render_catalog_register(patient_id: str, selected_date: date) -> None:
         ["Desayuno", "Comida", "Cena", "Snack"],
         key="catalog_meal",
     )
-    if st.button("✅ Confirmar y registrar", use_container_width=True):
+    if st.button("✅ Confirmar y registrar", width="stretch"):
         try:
             save_food(
                 patient_id,
@@ -602,7 +622,7 @@ def render_manual_register(patient_id: str, selected_date: date) -> None:
             fat = st.number_input("Grasas (g)", min_value=0.0, step=1.0, key="manual_fat")
             fiber = st.number_input("Fibra (g)", min_value=0.0, step=1.0, key="manual_fiber")
             water = st.number_input("Agua (ml)", min_value=0.0, step=50.0, key="manual_water")
-        submitted = st.form_submit_button("✅ Registrar manualmente", use_container_width=True)
+        submitted = st.form_submit_button("✅ Registrar manualmente", width="stretch")
 
     if submitted:
         if not food.strip():
@@ -638,14 +658,50 @@ def render_manual_register(patient_id: str, selected_date: date) -> None:
                     st.code(str(exc))
 
 
-def render_register(patient_id: str, selected_date: date) -> None:
-    st.title("➕ Registrar alimento")
-    ai_tab, catalog_tab, saved_tab, manual_tab = st.tabs(
+def render_log_date_controls(account_today: date) -> date:
+    """Selector de fecha visible dentro de la página.
+
+    Antes vivía sólo en la barra lateral, que Streamlit colapsa en el teléfono.
+    Como ahí es donde el paciente registra, la opción de corregir un día
+    olvidado quedaba fuera de la vista.
+    """
+    stored = st.session_state.get("selected_log_date")
+    if not isinstance(stored, date):
+        st.session_state["selected_log_date"] = account_today
+
+    col_today, col_yesterday, col_picker = st.columns([1, 1, 2])
+    if col_today.button("Hoy", width="stretch"):
+        st.session_state["selected_log_date"] = account_today
+        st.rerun()
+    if col_yesterday.button("Ayer", width="stretch"):
+        st.session_state["selected_log_date"] = account_today - timedelta(days=1)
+        st.rerun()
+    with col_picker:
+        chosen = st.date_input(
+            "Fecha",
+            key="selected_log_date",
+            max_value=account_today,
+            format="DD/MM/YYYY",
+        )
+
+    if chosen != account_today:
+        st.info(
+            f"Estás trabajando en el {chosen.strftime('%d/%m/%Y')}, "
+            "no en el día de hoy."
+        )
+    return chosen
+
+
+def render_register(patient_id: str, selected_date: date, account_today: date) -> date:
+    st.title("➕ Registrar")
+    selected_date = render_log_date_controls(account_today)
+    ai_tab, catalog_tab, saved_tab, manual_tab, activity_tab = st.tabs(
         [
             "✨ Describir comida",
             "🔎 Desde catálogo",
             "⭐ Platillos guardados",
             "✍️ Registro manual",
+            "🏃 Actividad",
         ]
     )
     with ai_tab:
@@ -656,13 +712,19 @@ def render_register(patient_id: str, selected_date: date) -> None:
         render_saved_meals(patient_id, selected_date)
     with manual_tab:
         render_manual_register(patient_id, selected_date)
+    with activity_tab:
+        render_activity_register(patient_id, selected_date)
+    return selected_date
 
 
 def render_history(patient_id: str, current_date: date) -> None:
     st.title("📊 Historial")
-    nutrition_tab, body_tab = st.tabs(
-        ["🍽️ Alimentación", "⚖️ Evolución corporal"]
+    nutrition_tab, activity_tab, body_tab = st.tabs(
+        ["🍽️ Alimentación", "🏃 Actividad", "⚖️ Evolución corporal"]
     )
+    # El balance contra la actividad necesita el consumo diario, que se calcula
+    # en la pestaña de alimentación.
+    energy_by_day = pd.DataFrame()
 
     with nutrition_tab:
         try:
@@ -692,6 +754,7 @@ def render_history(patient_id: str, current_date: date) -> None:
                 .sum()
                 .sort_values("log_date")
             )
+            energy_by_day = df_history[["log_date", "calories"]].copy()
             start_date = pd.Timestamp(current_date - timedelta(days=6))
             week_df = df_history[df_history["log_date"] >= start_date]
 
@@ -717,7 +780,7 @@ def render_history(patient_id: str, current_date: date) -> None:
                     "kcal",
                     zero=True,
                 ),
-                use_container_width=True,
+                width="stretch",
                 on_select="ignore",
             )
             st.subheader("🥩 Macronutrientes")
@@ -733,7 +796,7 @@ def render_history(patient_id: str, current_date: date) -> None:
                     "Gramos",
                     zero=True,
                 ),
-                use_container_width=True,
+                width="stretch",
                 on_select="ignore",
             )
             st.subheader("Datos")
@@ -747,7 +810,10 @@ def render_history(patient_id: str, current_date: date) -> None:
                     "water": "Agua (ml)",
                 }
             )
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, width="stretch", hide_index=True)
+
+    with activity_tab:
+        render_activity_history(patient_id, energy_by_day)
 
     with body_tab:
         try:
@@ -805,7 +871,7 @@ def render_history(patient_id: str, current_date: date) -> None:
                         {"weight_kg": "Peso"},
                         "kg",
                     ),
-                    use_container_width=True,
+                    width="stretch",
                     on_select="ignore",
                 )
 
@@ -825,7 +891,7 @@ def render_history(patient_id: str, current_date: date) -> None:
                         },
                         "Porcentaje",
                     ),
-                    use_container_width=True,
+                    width="stretch",
                     on_select="ignore",
                 )
 
@@ -842,7 +908,7 @@ def render_history(patient_id: str, current_date: date) -> None:
                         {"bmi": "IMC", "visceral_fat": "Grasa visceral"},
                         "Valor",
                     ),
-                    use_container_width=True,
+                    width="stretch",
                     on_select="ignore",
                 )
 
@@ -910,7 +976,7 @@ def render_body_measurement_editor(
             disabled=not can_update_current_weight,
         )
         save_changes = st.form_submit_button(
-            "Guardar corrección", use_container_width=True
+            "Guardar corrección", width="stretch"
         )
     if save_changes:
         try:
@@ -983,7 +1049,7 @@ def render_profile_and_goals(
                 activity_level = st.selectbox(
                     "Nivel de actividad habitual", activity_options, index=activity_index
                 )
-                save_profile = st.form_submit_button("Guardar perfil", use_container_width=True)
+                save_profile = st.form_submit_button("Guardar perfil", width="stretch")
             if save_profile:
                 try:
                     update_profile(
@@ -1107,7 +1173,7 @@ def render_profile_and_goals(
 
             apply_calculation = st.button(
                 "Aplicar cálculo a las metas",
-                use_container_width=True,
+                width="stretch",
                 disabled=not can_edit_goals or calculated_targets is None,
             )
             if apply_calculation and calculated_targets:
@@ -1136,7 +1202,7 @@ def render_profile_and_goals(
             goal_fat = st.number_input("Grasas (g/día)", min_value=0.0, step=5.0, disabled=not can_edit_goals, key=f"{goal_prefix}_fat")
             goal_fiber = st.number_input("Fibra (g/día)", min_value=0.0, step=1.0, disabled=not can_edit_goals, key=f"{goal_prefix}_fiber")
             goal_water = st.number_input("Agua (ml/día)", min_value=0.0, step=100.0, disabled=not can_edit_goals, key=f"{goal_prefix}_water")
-            save_goals = st.form_submit_button("Guardar metas", use_container_width=True, disabled=not can_edit_goals)
+            save_goals = st.form_submit_button("Guardar metas", width="stretch", disabled=not can_edit_goals)
         if save_goals:
             try:
                 calculation_metadata = st.session_state.get(
@@ -1209,7 +1275,7 @@ def render_profile_and_goals(
                     disabled=not can_edit_profile,
                 )
                 measurement_notes = st.text_area("Notas (opcional)")
-                save_measurement = st.form_submit_button("Guardar medición", use_container_width=True)
+                save_measurement = st.form_submit_button("Guardar medición", width="stretch")
             if save_measurement:
                 try:
                     save_body_measurement(
@@ -1252,7 +1318,7 @@ def render_profile_and_goals(
                 ]
                 st.dataframe(
                     display_measurements[visible_columns],
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
                 st.markdown("#### Corregir o eliminar mediciones")
@@ -1273,7 +1339,7 @@ def render_profile_and_goals(
                         if action1.button(
                             "✏️ Corregir",
                             key=f"edit_measurement_{measurement_id}",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             st.session_state["editing_measurement_id"] = measurement_id
                             st.session_state.pop("deleting_measurement_id", None)
@@ -1281,7 +1347,7 @@ def render_profile_and_goals(
                         if action2.button(
                             "🗑️ Eliminar",
                             key=f"delete_measurement_{measurement_id}",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             st.session_state["deleting_measurement_id"] = measurement_id
                             st.session_state.pop("editing_measurement_id", None)
@@ -1303,7 +1369,7 @@ def render_profile_and_goals(
                             if confirm_col.button(
                                 "Confirmar eliminación",
                                 key=f"confirm_delete_measurement_{measurement_id}",
-                                use_container_width=True,
+                                width="stretch",
                             ):
                                 try:
                                     delete_body_measurement(measurement_id, patient_id)
@@ -1320,7 +1386,7 @@ def render_profile_and_goals(
                             if cancel_col.button(
                                 "Cancelar",
                                 key=f"cancel_delete_measurement_{measurement_id}",
-                                use_container_width=True,
+                                width="stretch",
                             ):
                                 st.session_state.pop("deleting_measurement_id", None)
                                 st.rerun()
@@ -1367,13 +1433,23 @@ def render_catalog_admin() -> None:
                 fat = st.number_input("Grasas por 100 g", min_value=0.0, step=1.0)
                 fiber = st.number_input("Fibra por 100 g", min_value=0.0, step=1.0)
                 water = st.number_input("Agua por 100 g", min_value=0.0, step=1.0)
-            st.caption("Porción casera opcional")
+            is_liquid = st.checkbox(
+                "Es un líquido (habilita mililitros)",
+                help=(
+                    "Marca esta casilla para que el alimento pueda registrarse en "
+                    "mililitros además de gramos."
+                ),
+            )
+            st.caption(
+                "Porción casera opcional. Después podrás agregar todas las que "
+                "necesites desde Mis alimentos."
+            )
             portion_col1, portion_col2 = st.columns(2)
             with portion_col1:
                 portion_name = st.text_input("Nombre de la porción", placeholder="Ej. pieza mediana")
             with portion_col2:
                 portion_grams = st.number_input("Gramos por porción", min_value=0.0, step=1.0)
-            submitted = st.form_submit_button("Guardar en catálogo", use_container_width=True)
+            submitted = st.form_submit_button("Guardar en catálogo", width="stretch")
 
         if submitted:
             if not name.strip():
@@ -1382,7 +1458,7 @@ def render_catalog_admin() -> None:
                 st.error("Completa tanto el nombre como los gramos de la porción.")
             else:
                 try:
-                    create_catalog_food(
+                    new_food_id = create_catalog_food(
                         name,
                         brand,
                         calories,
@@ -1394,6 +1470,10 @@ def render_catalog_admin() -> None:
                         portion_name,
                         portion_grams if portion_grams > 0 else None,
                     )
+                    if portion_name.strip() and portion_grams > 0:
+                        add_catalog_portion(new_food_id, portion_name, portion_grams)
+                    if is_liquid:
+                        set_catalog_food_liquid(new_food_id, True)
                     st.success("Alimento agregado al catálogo.")
                 except Exception as exc:
                     st.error("No se pudo crear el alimento.")
@@ -1437,8 +1517,8 @@ def render_catalog_admin() -> None:
                             import_df[column], errors="coerce"
                         ).fillna(0)
                     import_df = import_df[CATALOG_IMPORT_COLUMNS].fillna("")
-                    st.dataframe(import_df.head(25), use_container_width=True, hide_index=True)
-                    if st.button("Importar alimentos", use_container_width=True):
+                    st.dataframe(import_df.head(25), width="stretch", hide_index=True)
+                    if st.button("Importar alimentos", width="stretch"):
                         imported = import_catalog_foods(import_df.to_dict(orient="records"))
                         st.success(f"Se importaron {imported} alimentos.")
             except Exception as exc:
@@ -1451,36 +1531,151 @@ def render_catalog_admin() -> None:
         )
 
     with list_tab:
-        try:
-            owned_foods = list_owned_catalog()
-        except Exception as exc:
-            st.error("No se pudo cargar el catálogo.")
+        render_owned_catalog_list()
+
+
+CATALOG_PAGE_SIZE = 50
+
+
+def render_owned_catalog_list() -> None:
+    """Catálogo propio con búsqueda y páginas.
+
+    Antes se pedía la tabla completa sin paginar y se recortaba a 200 renglones.
+    Con un catálogo importado de casi 1900 alimentos, sólo se alcanzaban a ver
+    los que empiezan con A.
+    """
+    if notice := st.session_state.pop("catalog_notice", None):
+        st.success(str(notice))
+
+    search = st.text_input(
+        "Buscar en mi catálogo",
+        key="catalog_admin_search",
+        placeholder="Ej. tortilla, res, leche",
+    )
+
+    try:
+        total = count_owned_catalog(search)
+    except Exception as exc:
+        st.error("No se pudo cargar el catálogo.")
+        with st.expander("Detalle técnico"):
             st.code(str(exc))
-            owned_foods = []
-        if not owned_foods:
-            st.info("Todavía no has creado alimentos.")
+        return
+
+    if not total:
+        if search.strip():
+            st.info("Ningún alimento de tu catálogo coincide con esa búsqueda.")
         else:
-            st.caption(f"{len(owned_foods)} alimentos")
-            for food in owned_foods[:200]:
-                col_name, col_values, col_delete = st.columns([4, 4, 1])
-                with col_name:
-                    st.write(f"**{food['name']}**")
-                    st.caption(str(food.get("brand") or food.get("source") or ""))
-                with col_values:
+            st.info("Todavía no has creado alimentos.")
+        return
+
+    page_count = max((total + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE, 1)
+    page = 1
+    if page_count > 1:
+        page = st.number_input(
+            f"Página (de {page_count})",
+            min_value=1,
+            max_value=page_count,
+            step=1,
+            value=1,
+            key="catalog_admin_page",
+        )
+    start = (int(page) - 1) * CATALOG_PAGE_SIZE
+
+    # Se pide sólo la página visible: traer los casi 1900 alimentos y sus
+    # medidas en cada recarga haría lenta la pantalla.
+    try:
+        visible = list_owned_catalog(search, limit=CATALOG_PAGE_SIZE, offset=start)
+    except Exception as exc:
+        st.error("No se pudo cargar el catálogo.")
+        with st.expander("Detalle técnico"):
+            st.code(str(exc))
+        return
+
+    st.caption(
+        f"{total} alimentos · mostrando {start + 1}–{start + len(visible)}"
+    )
+
+    for food in visible:
+        portions = food.get("portions") or []
+        measures = ", ".join(
+            f"{portion['portion_name']} = {float(portion['grams']):.0f} g"
+            for portion in portions
+        )
+        header = f"{food['name']}"
+        if food.get("brand"):
+            header += f" · {food['brand']}"
+        with st.expander(header):
+            st.caption(
+                f"100 g: {float(food['calories_per_100g']):.0f} kcal · "
+                f"P {float(food['protein_per_100g']):.1f} · "
+                f"CHO {float(food['carbs_per_100g']):.1f} · "
+                f"G {float(food['fat_per_100g']):.1f} · "
+                f"Fuente: {food.get('source') or 'Catálogo'}"
+            )
+            st.write(f"**Medidas disponibles:** {measures or 'sólo gramos'}")
+
+            liquid = st.checkbox(
+                "Es un líquido (habilita mililitros)",
+                value=bool(food.get("is_liquid")),
+                key=f"catalog_liquid_{food['id']}",
+            )
+            if liquid != bool(food.get("is_liquid")):
+                try:
+                    set_catalog_food_liquid(str(food["id"]), liquid)
+                    st.session_state["catalog_notice"] = "Se actualizó el tipo de alimento."
+                    st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo actualizar el alimento.")
+                    st.code(str(exc))
+
+            for portion in portions:
+                col_portion, col_remove = st.columns([6, 1])
+                with col_portion:
                     st.caption(
-                        f"100 g: {float(food['calories_per_100g']):.0f} kcal · "
-                        f"P {float(food['protein_per_100g']):.1f} · "
-                        f"CHO {float(food['carbs_per_100g']):.1f} · "
-                        f"G {float(food['fat_per_100g']):.1f}"
+                        f"1 {portion['portion_name']} = {float(portion['grams']):.1f} g"
                     )
-                with col_delete:
-                    if st.button("🗑️", key=f"delete_catalog_{food['id']}"):
+                with col_remove:
+                    if st.button("🗑️", key=f"delete_portion_{portion['id']}"):
                         try:
-                            delete_catalog_food(str(food["id"]))
+                            delete_catalog_portion(str(portion["id"]))
+                            st.session_state["catalog_notice"] = "Medida eliminada."
                             st.rerun()
                         except Exception as exc:
-                            st.error("No se pudo eliminar.")
+                            st.error("No se pudo eliminar la medida.")
                             st.code(str(exc))
+
+            with st.form(f"add_portion_{food['id']}", clear_on_submit=True):
+                col_name, col_grams = st.columns(2)
+                with col_name:
+                    new_portion = st.text_input(
+                        "Nueva medida", placeholder="Ej. taza, pieza, cucharada"
+                    )
+                with col_grams:
+                    new_grams = st.number_input(
+                        "Equivale a (g)", min_value=0.0, step=1.0
+                    )
+                if st.form_submit_button("Agregar medida", width="stretch"):
+                    if not new_portion.strip() or new_grams <= 0:
+                        st.error("Escribe el nombre de la medida y sus gramos.")
+                    else:
+                        try:
+                            add_catalog_portion(
+                                str(food["id"]), new_portion, new_grams
+                            )
+                            st.session_state["catalog_notice"] = "Medida agregada."
+                            st.rerun()
+                        except Exception as exc:
+                            st.error("No se pudo agregar la medida.")
+                            st.code(str(exc))
+
+            if st.button("🗑️ Eliminar alimento", key=f"delete_catalog_{food['id']}"):
+                try:
+                    delete_catalog_food(str(food["id"]))
+                    st.session_state["catalog_notice"] = "Alimento eliminado."
+                    st.rerun()
+                except Exception as exc:
+                    st.error("No se pudo eliminar.")
+                    st.code(str(exc))
 
 
 def render_link_nutritionist(patient_id: str) -> None:
@@ -1492,7 +1687,7 @@ def render_link_nutritionist(patient_id: str) -> None:
     st.write("Solicita a tu nutriólogo su código de vinculación e introdúcelo aquí.")
     with st.form("link_nutritionist_form"):
         code = st.text_input("Código de vinculación").upper()
-        submitted = st.form_submit_button("Vincular", use_container_width=True)
+        submitted = st.form_submit_button("Vincular", width="stretch")
     if submitted:
         if not code.strip():
             st.error("Escribe el código.")
@@ -1538,17 +1733,35 @@ if role == "patient":
 else:
     assigned_patients = list_assigned_patients()
     st.sidebar.info(f"Código para tus pacientes: {auth.get('invite_code')}")
-    if assigned_patients:
-        patient_by_label = {
+
+    # El nutriólogo también lleva su propio seguimiento. Su expediente existe
+    # desde que creó la cuenta; la versión anterior sólo dejaba de apuntarlo al
+    # promoverlo, y por eso hacía falta abrir una segunda cuenta.
+    own_patient_id = str(auth.get("patient_id") or "")
+    patient_by_label: dict[str, dict] = {}
+    if own_patient_id:
+        patient_by_label[SELF_TRACKING_LABEL] = {"id": own_patient_id}
+    patient_by_label.update(
+        {
             f"{row['name']} · {str(row['id'])[:8]}": row for row in assigned_patients
         }
-        selected_label = st.sidebar.selectbox("Paciente", list(patient_by_label))
-        patient_profile = patient_by_label[selected_label]
-        patient_id = str(patient_profile["id"])
-    pages = [
-        "🏠 Resumen", "📊 Historial", "👤 Perfil y metas",
-        "🍎 Catálogo", "🍲 Recetas",
-    ]
+    )
+
+    if patient_by_label:
+        selected_label = st.sidebar.selectbox("Expediente", list(patient_by_label))
+        selected_record = patient_by_label[selected_label]
+        patient_id = str(selected_record["id"])
+        # list_assigned_patients ya trae el expediente completo; sólo el propio
+        # entra a la lista con el identificador solo.
+        patient_profile = (
+            selected_record if "name" in selected_record else get_profile(patient_id)
+        )
+    viewing_self = bool(own_patient_id) and patient_id == own_patient_id
+
+    pages = ["🏠 Resumen", "📊 Historial", "👤 Perfil y metas"]
+    if viewing_self:
+        pages.insert(1, "➕ Registrar")
+    pages += ["🍎 Catálogo", "🍲 Recetas"]
     page = st.sidebar.radio("Navegación", pages)
 
 with st.sidebar.expander("⚙️ Configuración"):
@@ -1561,7 +1774,7 @@ with st.sidebar.expander("⚙️ Configuración"):
         key="account_timezone",
     )
     st.caption(f"Fecha local actual: {account_today.strftime('%d/%m/%Y')}")
-    if st.button("Guardar zona horaria", use_container_width=True):
+    if st.button("Guardar zona horaria", width="stretch"):
         try:
             update_account_timezone(
                 str(auth.get("id") or ""),
@@ -1580,13 +1793,11 @@ with st.sidebar.expander("⚙️ Configuración"):
 if timezone_notice := st.session_state.pop("timezone_notice", None):
     st.sidebar.success(str(timezone_notice))
 
-selected_date = st.sidebar.date_input(
-    "Fecha",
-    value=account_today,
-    key="selected_log_date",
-)
+selected_date = st.session_state.get("selected_log_date")
+if not isinstance(selected_date, date):
+    selected_date = account_today
 st.sidebar.divider()
-if st.sidebar.button("Cerrar sesión", use_container_width=True):
+if st.sidebar.button("Cerrar sesión", width="stretch"):
     sign_out()
     st.rerun()
 
@@ -1600,9 +1811,13 @@ if role == "nutritionist" and page == "🍲 Recetas":
 
 if role == "nutritionist" and not patient_id:
     st.title("👥 Pacientes")
-    st.info("Aún no tienes pacientes vinculados.")
+    st.info("Aún no tienes pacientes vinculados ni expediente propio.")
     st.write("Comparte este código con tus pacientes:")
     st.code(str(auth.get("invite_code") or ""))
+    st.caption(
+        "Para llevar además tu propio seguimiento, ejecuta en Supabase "
+        "`select public.repair_nutritionist_self_tracking();` de la migración V0.9."
+    )
     st.stop()
 
 assert patient_id is not None and patient_profile is not None
@@ -1613,16 +1828,19 @@ except Exception as exc:
     st.code(str(exc))
     st.stop()
 
+owns_record = role == "patient" or patient_id == str(auth.get("patient_id") or "")
+
 if page in ("🏠 Mi día", "🏠 Resumen"):
     render_day(
         patient_id,
         goals,
         selected_date,
         can_edit=True,
-        can_delete=role == "patient",
+        can_delete=owns_record,
+        account_today=account_today,
     )
 elif page == "➕ Registrar":
-    render_register(patient_id, selected_date)
+    selected_date = render_register(patient_id, selected_date, account_today)
 elif page == "📊 Historial":
     render_history(patient_id, account_today)
 elif page == "👤 Perfil y metas":
