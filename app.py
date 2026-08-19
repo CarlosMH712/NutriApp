@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import io
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -22,6 +24,7 @@ from db import (
     delete_catalog_food,
     delete_catalog_portion,
     delete_food,
+    export_patient_data,
     get_auth_context,
     get_body_measurements,
     get_day_log,
@@ -36,12 +39,15 @@ from db import (
     save_food,
     save_body_measurement,
     search_catalog,
+    send_password_reset,
+    set_catalog_food_density,
     set_catalog_food_liquid,
     sign_in,
     sign_out,
     sign_up,
     update_food,
     update_account_timezone,
+    update_password,
     update_body_measurement,
     update_goals,
     update_patient_weight,
@@ -78,6 +84,10 @@ from activity_workflows import (
     render_activity_history,
     render_activity_register,
 )
+from nutritionist_dashboard import render_patient_dashboard
+from adherence import daily_totals, weekly_comparison
+from meal_ai import MealAIConfigError, MealAIError, gemini_configured
+from weekly_summary import build_context, generate_weekly_summary
 
 
 st.set_page_config(page_title="Mi Nutrición", page_icon="🥗", layout="wide")
@@ -99,7 +109,9 @@ def auth_screen() -> dict:
 
     st.title("🥗 Mi Nutrición")
     st.write("Registra tus alimentos y da seguimiento a tus metas nutricionales.")
-    login_tab, register_tab = st.tabs(["Iniciar sesión", "Crear cuenta"])
+    login_tab, register_tab, recover_tab = st.tabs(
+        ["Iniciar sesión", "Crear cuenta", "Olvidé mi contraseña"]
+    )
 
     with login_tab:
         st.caption(
@@ -134,6 +146,38 @@ def auth_screen() -> dict:
                     st.error("No fue posible iniciar sesión. Revisa tu correo y contraseña.")
                     with st.expander("Detalle técnico"):
                         st.code(str(exc))
+
+    with recover_tab:
+        st.caption(
+            "Te enviaremos un enlace para restablecer tu contraseña. Ábrelo "
+            "desde el mismo dispositivo donde usas la aplicación."
+        )
+        with st.form("recover_form"):
+            recover_email = st.text_input(
+                "Correo electrónico",
+                key="recover_email",
+                autocomplete="email",
+            )
+            recover_submitted = st.form_submit_button(
+                "Enviar enlace", width="stretch"
+            )
+        if recover_submitted:
+            # La respuesta es idéntica exista o no la cuenta. Mostrar un
+            # mensaje distinto revelaría qué correos están registrados.
+            same_answer = (
+                "Si ese correo tiene una cuenta, recibirás el enlace en "
+                "unos minutos. Revisa también la carpeta de spam."
+            )
+            try:
+                send_password_reset(recover_email)
+            except ValueError as exc:
+                st.error(str(exc))
+            except DatabaseConfigError as exc:
+                st.error(str(exc))
+            except Exception:
+                st.success(same_answer)
+            else:
+                st.success(same_answer)
 
     with register_tab:
         st.caption("Las cuentas nuevas se crean como pacientes.")
@@ -717,10 +761,118 @@ def render_register(patient_id: str, selected_date: date, account_today: date) -
     return selected_date
 
 
-def render_history(patient_id: str, current_date: date) -> None:
+def render_summary_and_export(
+    patient_id: str, raw_history: pd.DataFrame, goals: dict, current_date: date
+) -> None:
+    """Adherencia de la semana, resumen redactado y respaldo del expediente."""
+    totals = daily_totals(raw_history)
+    goal_calories = float(goals.get("calories") or 0)
+    comparison = weekly_comparison(totals, current_date, goal_calories)
+    current = comparison["current"]
+    previous = comparison["previous"]
+
+    st.subheader("Semana en curso")
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "Días registrados",
+        f"{current['days_logged']} / 7",
+        f"{comparison['logging_rate']:.0f}% del periodo",
+    )
+    col2.metric(
+        "Adherencia calórica",
+        f"{current['adherence_pct']:.0f}%",
+        f"{current['days_on_target']} de {current['days_logged']} días en rango",
+    )
+    col3.metric(
+        "Promedio de energía",
+        f"{current['avg_calories']:.0f} kcal",
+        f"{comparison['calorie_delta']:+.0f} kcal vs. semana previa",
+    )
+    st.caption(
+        "Adherencia es el porcentaje de días **registrados** cuyas calorías "
+        "quedaron a ±10% de la meta. Con pocos días de registro la cifra sube "
+        "fácil, por eso conviene leerla junto al número de días."
+    )
+
+    if not current["days_logged"]:
+        st.info("Todavía no hay registros de esta semana.")
+
+    st.divider()
+    st.subheader("Resumen redactado")
+    if not gemini_configured():
+        st.info(
+            "Para generar el resumen con IA agrega la clave de Gemini en los Secrets."
+        )
+    elif not current["days_logged"]:
+        st.caption("Se necesita al menos un día registrado para redactar el resumen.")
+    else:
+        st.caption(
+            "Las cifras las calcula la aplicación; el modelo sólo las redacta. "
+            "No se envía nombre, correo ni identificador."
+        )
+        if st.button("✨ Redactar resumen de la semana", width="stretch"):
+            context = build_context(
+                current_date,
+                goals,
+                current,
+                previous,
+                float(comparison["calorie_delta"]),
+                float(comparison["logging_rate"]),
+            )
+            try:
+                with st.spinner("Redactando..."):
+                    st.session_state["weekly_summary_text"] = generate_weekly_summary(
+                        context
+                    )
+            except (MealAIConfigError, MealAIError) as exc:
+                st.error(str(exc))
+        if summary_text := st.session_state.get("weekly_summary_text"):
+            st.info(str(summary_text))
+            st.caption(
+                "Texto generado automáticamente. No sustituye la indicación de "
+                "tu nutriólogo."
+            )
+
+    st.divider()
+    st.subheader("Exportar expediente")
+    st.caption(
+        "Descarga todo lo registrado en archivos CSV, para respaldo o para "
+        "llevarlo a otra herramienta."
+    )
+    if st.button("Preparar descarga", width="stretch"):
+        try:
+            with st.spinner("Reuniendo la información..."):
+                st.session_state["export_bundle"] = _build_export_zip(patient_id)
+        except Exception as exc:
+            st.error("No se pudo preparar la exportación.")
+            with st.expander("Detalle técnico"):
+                st.code(str(exc))
+    if bundle := st.session_state.get("export_bundle"):
+        st.download_button(
+            "⬇️ Descargar expediente (ZIP)",
+            data=bundle,
+            file_name=f"expediente_{current_date.isoformat()}.zip",
+            mime="application/zip",
+            width="stretch",
+        )
+
+
+def _build_export_zip(patient_id: str) -> bytes:
+    """Empaqueta el expediente como CSV dentro de un ZIP."""
+    exports = export_patient_data(patient_id)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for name, frame in exports.items():
+            bundle.writestr(
+                f"{name}.csv", frame.to_csv(index=False, encoding="utf-8")
+            )
+    return buffer.getvalue()
+
+
+def render_history(patient_id: str, current_date: date, goals: dict) -> None:
     st.title("📊 Historial")
-    nutrition_tab, activity_tab, body_tab = st.tabs(
-        ["🍽️ Alimentación", "🏃 Actividad", "⚖️ Evolución corporal"]
+    nutrition_tab, activity_tab, body_tab, summary_tab = st.tabs(
+        ["🍽️ Alimentación", "🏃 Actividad", "⚖️ Evolución corporal", "📄 Resumen"]
     )
     # El balance contra la actividad necesita el consumo diario, que se calcula
     # en la pestaña de alimentación.
@@ -814,6 +966,9 @@ def render_history(patient_id: str, current_date: date) -> None:
 
     with activity_tab:
         render_activity_history(patient_id, energy_by_day)
+
+    with summary_tab:
+        render_summary_and_export(patient_id, raw_history, goals, current_date)
 
     with body_tab:
         try:
@@ -1628,6 +1783,31 @@ def render_owned_catalog_list() -> None:
                     st.error("No se pudo actualizar el alimento.")
                     st.code(str(exc))
 
+            if liquid:
+                with st.form(f"density_{food['id']}"):
+                    current_density = float(food.get("density_g_per_ml") or 0)
+                    density = st.number_input(
+                        "Densidad (g/ml)",
+                        min_value=0.0,
+                        max_value=5.0,
+                        step=0.01,
+                        value=current_density,
+                        help=(
+                            "Cuántos gramos pesa un mililitro. Agua 1.0, aceite "
+                            "0.92, leche 1.03, miel 1.4. En blanco se asume 1.0."
+                        ),
+                    )
+                    if st.form_submit_button("Guardar densidad", width="stretch"):
+                        try:
+                            set_catalog_food_density(
+                                str(food["id"]), density if density > 0 else None
+                            )
+                            st.session_state["catalog_notice"] = "Densidad actualizada."
+                            st.rerun()
+                        except Exception as exc:
+                            st.error("No se pudo guardar la densidad.")
+                            st.code(str(exc))
+
             for portion in portions:
                 col_portion, col_remove = st.columns([6, 1])
                 with col_portion:
@@ -1758,9 +1938,9 @@ else:
         )
     viewing_self = bool(own_patient_id) and patient_id == own_patient_id
 
-    pages = ["🏠 Resumen", "📊 Historial", "👤 Perfil y metas"]
+    pages = ["👥 Panel", "🏠 Resumen", "📊 Historial", "👤 Perfil y metas"]
     if viewing_self:
-        pages.insert(1, "➕ Registrar")
+        pages.insert(2, "➕ Registrar")
     pages += ["🍎 Catálogo", "🍲 Recetas"]
     page = st.sidebar.radio("Navegación", pages)
 
@@ -1790,6 +1970,31 @@ with st.sidebar.expander("⚙️ Configuración"):
             )
             st.code(str(exc))
 
+    st.divider()
+    # Quien llega desde el enlace de recuperación entra con sesión activa y
+    # necesita fijar aquí su contraseña nueva.
+    with st.form("change_password_form", clear_on_submit=True):
+        st.caption("Cambiar contraseña")
+        new_pass = st.text_input(
+            "Nueva contraseña", type="password", autocomplete="new-password"
+        )
+        confirm_pass = st.text_input(
+            "Confirmar", type="password", autocomplete="new-password"
+        )
+        if st.form_submit_button("Actualizar contraseña", width="stretch"):
+            if new_pass != confirm_pass:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                try:
+                    update_password(new_pass)
+                    st.session_state["timezone_notice"] = "Contraseña actualizada."
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error("No se pudo actualizar la contraseña.")
+                    st.code(str(exc))
+
 if timezone_notice := st.session_state.pop("timezone_notice", None):
     st.sidebar.success(str(timezone_notice))
 
@@ -1800,6 +2005,10 @@ st.sidebar.divider()
 if st.sidebar.button("Cerrar sesión", width="stretch"):
     sign_out()
     st.rerun()
+
+if role == "nutritionist" and page == "👥 Panel":
+    render_patient_dashboard(account_today)
+    st.stop()
 
 if role == "nutritionist" and page == "🍎 Catálogo":
     render_catalog_admin()
@@ -1842,7 +2051,7 @@ if page in ("🏠 Mi día", "🏠 Resumen"):
 elif page == "➕ Registrar":
     selected_date = render_register(patient_id, selected_date, account_today)
 elif page == "📊 Historial":
-    render_history(patient_id, account_today)
+    render_history(patient_id, account_today, goals)
 elif page == "👤 Perfil y metas":
     patient_linked = patient_has_nutritionist(patient_id)
     render_profile_and_goals(

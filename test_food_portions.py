@@ -123,5 +123,40 @@ class CalculateServingTests(unittest.TestCase):
             calculate_food_serving(build_food(), 0, GRAMS)
 
 
+class DensityTests(unittest.TestCase):
+    def test_without_density_assumes_water(self):
+        food = build_food(name="Agua natural", is_liquid=True)
+        result = calculate_food_serving(food, 250, MILLILITERS)
+        self.assertAlmostEqual(result["grams"], 250.0)
+
+    def test_oil_weighs_less_than_its_volume(self):
+        """1 ml de aceite pesa 0.92 g; antes se contaba como 1 g."""
+        food = build_food(
+            name="Aceite de oliva", is_liquid=True, density_g_per_ml=0.92,
+            calories_per_100g=884,
+        )
+        result = calculate_food_serving(food, 100, MILLILITERS)
+        self.assertAlmostEqual(result["grams"], 92.0)
+        self.assertAlmostEqual(result["calories"], 884 * 0.92, places=2)
+
+    def test_honey_weighs_more_than_its_volume(self):
+        food = build_food(name="Miel", is_liquid=True, density_g_per_ml=1.4)
+        self.assertAlmostEqual(
+            calculate_food_serving(food, 100, MILLILITERS)["grams"], 140.0
+        )
+
+    def test_invalid_density_falls_back_to_one(self):
+        food = build_food(name="Leche", is_liquid=True, density_g_per_ml=0)
+        self.assertAlmostEqual(
+            calculate_food_serving(food, 200, MILLILITERS)["grams"], 200.0
+        )
+
+    def test_density_does_not_affect_grams(self):
+        food = build_food(name="Aceite", is_liquid=True, density_g_per_ml=0.92)
+        self.assertAlmostEqual(
+            calculate_food_serving(food, 50, GRAMS)["grams"], 50.0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

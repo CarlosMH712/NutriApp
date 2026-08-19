@@ -11,10 +11,12 @@ from food_matching import (
     search_terms,
 )
 from db import (
+    AILimitError,
     create_meal_template,
     delete_meal_template,
     list_available_meal_templates,
     list_owned_meal_templates,
+    register_ai_interpretation,
     save_food_entries,
     search_catalog,
 )
@@ -40,6 +42,9 @@ NUTRIENT_FIELDS = ["calories", "protein", "carbs", "fat", "fiber", "water"]
 # Debajo de esta puntuación, la mejor coincidencia del catálogo no se parece
 # lo suficiente y conviene consultar además la fuente externa.
 WEAK_MATCH_SCORE = 0.62
+
+# Interpretaciones de platillo por paciente y día.
+DAILY_AI_LIMIT = 30
 
 
 def _normalize(value: object) -> str:
@@ -144,6 +149,8 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
     )
     if notice := st.session_state.pop("ai_saved_notice", None):
         st.success(str(notice))
+    if quota := st.session_state.pop("ai_quota_notice", None):
+        st.caption(str(quota))
     if not gemini_configured():
         st.info(
             "Para activar esta función agrega la clave de Gemini en los Secrets. "
@@ -165,6 +172,10 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
 
     if interpret_submitted:
         try:
+            # Se cuenta el uso antes de llamar al modelo: la cuota gratuita es
+            # de la cuenta, no del usuario, y basta con que alguien insista
+            # para dejar la función inservible para todos.
+            remaining = register_ai_interpretation(DAILY_AI_LIMIT)
             with st.spinner("Separando ingredientes y buscando equivalencias..."):
                 parsed = interpret_meal(description)
                 parsed_data = parsed.model_dump()
@@ -176,7 +187,13 @@ def render_ai_register(patient_id: str, selected_date: date) -> None:
                 st.session_state["ai_meal_run_id"] = parsed_data["run_id"]
                 st.session_state["ai_meal_description"] = description
                 st.session_state["ai_meal_result"] = parsed_data
+                if remaining <= 5:
+                    st.session_state["ai_quota_notice"] = (
+                        f"Te quedan {remaining} interpretaciones hoy."
+                    )
                 st.rerun()
+        except AILimitError as exc:
+            st.warning(str(exc))
         except (MealAIConfigError, MealAIError) as exc:
             st.error(str(exc))
         except Exception as exc:

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from food_matching import match_score, normalize, rank_by_relevance, search_terms
+from food_matching import (
+    fold_accents,
+    match_score,
+    normalize,
+    rank_by_relevance,
+    search_terms,
+)
 
 
 class SearchTermsTests(unittest.TestCase):
@@ -60,6 +66,38 @@ class RankByRelevanceTests(unittest.TestCase):
     def test_respects_the_limit(self):
         rows = [{"name": f"Alimento {index}"} for index in range(10)]
         self.assertEqual(len(rank_by_relevance("alimento", rows, limit=4)), 4)
+
+
+class FoldAccentsTests(unittest.TestCase):
+    """La búsqueda del catálogo depende de que esto coincida con la base.
+
+    `food_catalog.name_search` se calcula como `lower(unaccent(name))`. Si la
+    normalización de Python difiere, escribir "platano" deja de encontrar
+    "Plátano", que era el bug original: cerca del 18% de los alimentos
+    importados tienen acento o ñ.
+    """
+
+    def test_removes_accents(self):
+        self.assertEqual(fold_accents("Plátano"), "platano")
+
+    def test_handles_enye(self):
+        self.assertEqual(fold_accents("Piña Garapiñada"), "pina garapinada")
+
+    def test_keeps_punctuation_and_spaces(self):
+        # A diferencia de normalize(), aquí la puntuación se conserva porque
+        # lower(unaccent(...)) de Postgres tampoco la quita.
+        self.assertEqual(fold_accents("Zarzamora, Pulpa Con Azúcar"),
+                         "zarzamora, pulpa con azucar")
+
+    def test_lowercases(self):
+        self.assertEqual(fold_accents("ACELGA"), "acelga")
+
+    def test_empty_value(self):
+        self.assertEqual(fold_accents(None), "")
+
+    def test_a_query_without_accents_matches_the_stored_name(self):
+        stored = fold_accents("Alga spirulina máxima")
+        self.assertIn(fold_accents("maxima"), stored)
 
 
 if __name__ == "__main__":

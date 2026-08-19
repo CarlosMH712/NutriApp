@@ -92,6 +92,15 @@ def effective_water_ml(
     return stored
 
 
+DEFAULT_DENSITY_G_PER_ML = 1.0
+
+
+def food_density(food: dict) -> float:
+    """Gramos por mililitro del alimento; 1.0 si no se capturó."""
+    density = _nonnegative_number(food.get("density_g_per_ml"))
+    return density if density > 0 else DEFAULT_DENSITY_G_PER_ML
+
+
 def food_portions(food: dict) -> list[dict]:
     """Devuelve las medidas caseras de un alimento como [{name, grams}].
 
@@ -153,9 +162,10 @@ def calculate_food_serving(food: dict, amount: float, unit_choice: str) -> dict:
         grams = quantity
         saved_unit = "g"
     elif normalized_unit in {"ml", "mililitro", "mililitros"}:
-        # La base nutrimental está expresada por 100 g. Sin densidad específica,
-        # los líquidos se aproximan como 1 ml = 1 g y se muestran para revisión.
-        grams = quantity
+        # La base nutrimental está expresada por 100 g, así que los mililitros
+        # se convierten con la densidad del alimento. Sin densidad capturada se
+        # asume 1 g/ml, que es correcto para agua pero desvía en aceite o miel.
+        grams = quantity * food_density(food)
         saved_unit = "ml"
     else:
         matched = next(

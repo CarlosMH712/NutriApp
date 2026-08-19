@@ -8,7 +8,7 @@ import streamlit as st
 from supabase import Client, create_client
 
 from app_timezone import DEFAULT_TIMEZONE, normalize_timezone
-from food_matching import rank_by_relevance
+from food_matching import fold_accents, rank_by_relevance
 
 
 AUTH_STATE_KEYS = (
@@ -85,6 +85,28 @@ def sign_up(email: str, password: str, full_name: str) -> bool:
         return True
     _save_session(response.session)
     return False
+
+
+def send_password_reset(email: str, redirect_to: str = "") -> None:
+    """Envía el correo de recuperación de Supabase Auth.
+
+    No revela si la cuenta existe: Supabase responde igual en ambos casos y la
+    interfaz muestra el mismo mensaje, para no filtrar qué correos están dados
+    de alta.
+    """
+    clean_email = email.strip().lower()
+    if not clean_email or "@" not in clean_email:
+        raise ValueError("Escribe un correo electrónico válido.")
+    client = create_public_client()
+    options = {"redirect_to": redirect_to} if redirect_to.strip() else {}
+    client.auth.reset_password_for_email(clean_email, options)
+
+
+def update_password(new_password: str) -> None:
+    """Cambia la contraseña de la sesión activa."""
+    if len(new_password) < 8:
+        raise ValueError("La contraseña debe tener al menos 8 caracteres.")
+    get_supabase().auth.update_user({"password": new_password})
 
 
 def sign_in(email: str, password: str) -> None:
@@ -640,10 +662,33 @@ def link_nutritionist(invite_code: str) -> None:
 
 CATALOG_COLUMNS = (
     "id,name,brand,source,external_id,created_by,verified,is_liquid,"
+    "density_g_per_ml,"
     "calories_per_100g,protein_per_100g,carbs_per_100g,"
     "fat_per_100g,fiber_per_100g,water_per_100g,"
     "portion_name,portion_grams"
 )
+
+# La columna name_search llega con la migración V0.10. Si todavía no existe se
+# busca por name, que distingue acentos, para no dejar la app inservible.
+_NAME_SEARCH_AVAILABLE: bool | None = None
+
+
+def _name_search_available() -> bool:
+    global _NAME_SEARCH_AVAILABLE
+    if _NAME_SEARCH_AVAILABLE is None:
+        try:
+            get_supabase().table("food_catalog").select("name_search").limit(1).execute()
+            _NAME_SEARCH_AVAILABLE = True
+        except Exception:
+            _NAME_SEARCH_AVAILABLE = False
+    return _NAME_SEARCH_AVAILABLE
+
+
+def _filter_by_name(request: Any, query: str) -> Any:
+    """Filtra por nombre ignorando acentos cuando la base ya lo permite."""
+    if _name_search_available():
+        return request.ilike("name_search", f"%{fold_accents(query)}%")
+    return request.ilike("name", f"%{query}%")
 
 # PostgREST devuelve como máximo 1000 filas por consulta. Cualquier lectura que
 # pueda superar ese número debe pedir páginas hasta agotar el resultado.
@@ -710,10 +755,10 @@ def search_catalog(query: str, limit: int = 25) -> list[dict[str, Any]]:
     # buscar "carne" se llenaba de "carne de cerdo" y nunca llegaba a la de res.
     pool = min(max(int(limit) * 12, 120), 400)
     response = (
-        get_supabase()
-        .table("food_catalog")
-        .select(CATALOG_COLUMNS)
-        .ilike("name", f"%{clean_query}%")
+        _filter_by_name(
+            get_supabase().table("food_catalog").select(CATALOG_COLUMNS),
+            clean_query,
+        )
         .order("name")
         .limit(pool)
         .execute()
@@ -746,7 +791,7 @@ def list_owned_catalog(
             .eq("created_by", user_id)
         )
         if clean_query:
-            request = request.ilike("name", f"%{clean_query}%")
+            request = _filter_by_name(request, clean_query)
         return request.order("name")
 
     if limit is None:
@@ -773,7 +818,7 @@ def count_owned_catalog(query: str = "") -> int:
         .eq("created_by", user_id)
     )
     if clean_query:
-        request = request.ilike("name", f"%{clean_query}%")
+        request = _filter_by_name(request, clean_query)
     response = request.limit(1).execute()
     return int(response.count or 0)
 
@@ -1134,3 +1179,116 @@ def delete_exercise(exercise_id: int, patient_id: str) -> None:
         .eq("patient_id", patient_id)
         .execute()
     )
+
+
+def set_catalog_food_density(food_id: str, density: float | None) -> None:
+    """Gramos por mililitro del alimento. Sin valor, se asume 1.0 como el agua."""
+    get_supabase().rpc(
+        "set_catalog_food_density",
+        {
+            "p_food_id": food_id,
+            "p_density": float(density) if density and density > 0 else None,
+        },
+    ).execute()
+
+
+# ---------------------------------------------------------------------------
+# Panel del nutriólogo
+# ---------------------------------------------------------------------------
+
+
+def get_patient_summary(days: int = 7) -> pd.DataFrame:
+    """Resumen de todos los pacientes en una sola consulta."""
+    response = (
+        get_supabase()
+        .rpc("nutritionist_patient_summary", {"p_days": int(days)})
+        .execute()
+    )
+    columns = [
+        "patient_id", "patient_name", "goal_calories", "last_log_date",
+        "days_logged", "avg_calories", "avg_protein", "days_on_target",
+        "last_weight", "last_weight_date",
+    ]
+    return pd.DataFrame(response.data or [], columns=columns)
+
+
+# ---------------------------------------------------------------------------
+# Uso de la IA
+# ---------------------------------------------------------------------------
+
+
+class AILimitError(RuntimeError):
+    """Raised when the patient exhausted the daily interpretation quota."""
+
+
+def register_ai_interpretation(daily_limit: int = 30) -> int:
+    """Cuenta una interpretación y devuelve cuántas quedan hoy."""
+    try:
+        response = (
+            get_supabase()
+            .rpc("register_ai_interpretation", {"p_daily_limit": int(daily_limit)})
+            .execute()
+        )
+    except Exception as exc:
+        message = str(exc)
+        if "límite" in message or "limite" in message:
+            raise AILimitError(
+                f"Alcanzaste el límite de {daily_limit} interpretaciones por hoy. "
+                "Puedes seguir registrando desde el catálogo."
+            ) from exc
+        # Si la migración V0.10 aún no corre, no se bloquea el registro.
+        return daily_limit
+    return int(response.data if response.data is not None else daily_limit)
+
+
+# ---------------------------------------------------------------------------
+# Exportación del expediente
+# ---------------------------------------------------------------------------
+
+
+def export_patient_data(patient_id: str) -> dict[str, pd.DataFrame]:
+    """Todo lo registrado de un paciente, para respaldo o portabilidad."""
+    exports: dict[str, pd.DataFrame] = {}
+
+    exports["alimentos"] = pd.DataFrame(
+        _fetch_all(
+            lambda: get_supabase()
+            .table("food_log")
+            .select(
+                "log_date,meal,food,quantity,unit,calories,protein,carbs,"
+                "fat,fiber,water,source_name,source_id"
+            )
+            .eq("patient_id", patient_id)
+            .order("log_date")
+        )
+    )
+    exports["mediciones"] = pd.DataFrame(
+        _fetch_all(
+            lambda: get_supabase()
+            .table("body_measurements")
+            .select(
+                "measured_on,device,weight_kg,bmi,body_fat_pct,muscle_pct,"
+                "basal_calories,visceral_fat,metabolic_age,notes"
+            )
+            .eq("patient_id", patient_id)
+            .order("measured_on")
+        )
+    )
+    for name, table, columns in (
+        ("actividad", "activity_days", ACTIVITY_DAY_COLUMNS),
+        ("ejercicios", "exercise_log", EXERCISE_COLUMNS),
+    ):
+        try:
+            exports[name] = pd.DataFrame(
+                _fetch_all(
+                    lambda table=table, columns=columns: get_supabase()
+                    .table(table)
+                    .select(columns)
+                    .eq("patient_id", patient_id)
+                    .order("log_date")
+                )
+            )
+        except Exception:
+            # La actividad llegó en la V0.9; un proyecto sin migrar no la tiene.
+            exports[name] = pd.DataFrame()
+    return exports

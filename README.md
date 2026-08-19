@@ -1,4 +1,4 @@
-# 🥗 Mi Nutrición — V0.9 medidas, actividad y autoseguimiento
+# 🥗 Mi Nutrición — V0.10 búsqueda, panel y resumen semanal
 
 Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutricionales. Usa Supabase Auth, PostgreSQL y Row Level Security (RLS) para aislar los datos de cada paciente.
 
@@ -35,21 +35,28 @@ Aplicación Streamlit multiusuario para registrar alimentos y seguir metas nutri
 - Importación del archivo de exportación de la app Salud del iPhone.
 - Gráficas de actividad y comparación del consumo contra las calorías quemadas.
 - El nutriólogo lleva su propio seguimiento desde su misma cuenta.
+- Búsqueda que ignora acentos: "platano" encuentra "Plátano".
+- Recuperación de contraseña por correo y cambio desde la aplicación.
+- Panel con todos los pacientes, su adherencia y quién dejó de registrar.
+- Resumen semanal redactado a partir de cifras calculadas por la aplicación.
+- Exportación del expediente completo en archivos CSV.
+- Densidad por alimento para convertir mililitros a gramos.
+- Límite diario de interpretaciones con IA por paciente.
 
 ## 1. Actualizar la base de datos
 
-### Proyecto que ya tiene V0.8.2
+### Proyecto que ya tiene V0.9
 
 En Supabase **SQL Editor**, copia y ejecuta una sola vez:
 
 ```text
-supabase_v09_portions_activity_selftracking_migration.sql
+supabase_v10_search_dashboard_migration.sql
 ```
 
-Después ejecuta `select public.repair_nutritionist_self_tracking();` para que las
-cuentas de nutriólogo recuperen su expediente propio. Los detalles están en
-`GUIA_SUBIDA_V09.md`. La migración conserva pacientes, mediciones, catálogo y
-registros existentes.
+Los detalles están en `GUIA_SUBIDA_V10.md`. Si vienes de la V0.8.2, ejecuta
+antes la migración V0.9 y `select public.repair_nutritionist_self_tracking();`,
+como explica `GUIA_SUBIDA_V09.md`. Las migraciones conservan pacientes,
+mediciones, catálogo y registros existentes.
 
 ### Instalación nueva
 
@@ -62,6 +69,7 @@ Ejecuta en este orden:
 5. `supabase_v07_ai_recipes_migration.sql`
 6. `supabase_v08_2_timezone_migration.sql`
 7. `supabase_v09_portions_activity_selftracking_migration.sql`
+8. `supabase_v10_search_dashboard_migration.sql`
 
 Después de iniciar sesión abre **Configuración** en la barra lateral. La zona
 inicial es **Chihuahua** y cada usuario puede elegir otra región compatible.
@@ -232,7 +240,28 @@ resumen de ejercicios y la comparación del consumo contra las calorías quemada
 en actividad. Esa comparación no incluye el gasto en reposo, así que no
 representa el balance energético total.
 
-## 11. Ejecutar localmente
+## 11. Panel, resumen semanal y exportación
+
+**Panel del nutriólogo.** Es la primera pantalla al entrar. Muestra en una sola
+tabla a todos los pacientes con su semáforo de actividad, días con registro,
+adherencia calórica, promedio de energía y último peso, más una lista de a quién
+conviene contactar. Se arma con una sola consulta a la base.
+
+**Adherencia.** Porcentaje de días **registrados** cuyas calorías quedaron a
+±10% de la meta. Se calcula sobre los días con registro y no sobre los días del
+periodo, así que siempre se muestra junto al número de días: tres días perfectos
+de siete dan 100% de adherencia con apenas 43% de registro.
+
+**Resumen semanal.** En **Historial > Resumen**. Las cifras las calcula la
+aplicación y el modelo únicamente las redacta, de modo que no puede inventar
+promedios ni tendencias. Se envían sólo datos agregados: ni nombre, ni correo,
+ni identificador.
+
+**Exportación.** Descarga el expediente completo en archivos CSV dentro de un
+ZIP: alimentos, mediciones, actividad y ejercicios. Sirve como respaldo y para
+llevar la información a otra herramienta.
+
+## 12. Ejecutar localmente
 
 ```bash
 python3 -m venv .venv
@@ -241,7 +270,7 @@ pip install -r requirements.txt
 python3 -m streamlit run app.py
 ```
 
-## 12. Desplegar
+## 13. Desplegar
 
 Sube el código a GitHub sin `secrets.toml`. Streamlit Community Cloud actualizará la app desde el repositorio. Después verifica que **App settings > Secrets** incluya la configuración de Supabase, Gemini y, opcionalmente, FoodData Central.
 
@@ -253,9 +282,11 @@ El proyecto usa `unittest` de la biblioteca estándar. Desde la raíz:
 python3 -m unittest discover -s . -p "test_*.py" -t .
 ```
 
-Cubren el cálculo de metas y porciones, la coincidencia de nombres del catálogo,
-la paginación de las consultas, la lectura del archivo de Salud y pruebas de
-humo de la interfaz con `streamlit.testing`. No requieren conexión a Supabase.
+Cubren el cálculo de metas, porciones y densidad, la coincidencia de nombres
+del catálogo, la normalización de acentos, las métricas de adherencia, la
+paginación de las consultas, la lectura del archivo de Salud, el armado del
+resumen semanal y pruebas de humo de la interfaz con `streamlit.testing`.
+No requieren conexión a Supabase.
 
 ## Pruebas manuales recomendadas
 

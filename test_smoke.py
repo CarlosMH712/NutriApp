@@ -35,7 +35,10 @@ class AppSmokeTests(unittest.TestCase):
     def test_auth_screen_loads(self) -> None:
         app = AppTest.from_file(str(APP_FILE)).run(timeout=20)
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual([tab.label for tab in app.tabs], ["Iniciar sesión", "Crear cuenta"])
+        self.assertEqual(
+            [tab.label for tab in app.tabs],
+            ["Iniciar sesión", "Crear cuenta", "Olvidé mi contraseña"],
+        )
 
     def test_patient_can_save_timezone_and_uses_local_date(self) -> None:
         auth, profile, goals = self.patient_context()
@@ -487,9 +490,14 @@ class AppSmokeTests(unittest.TestCase):
             stack.enter_context(patch("db.get_profile", return_value=profile))
             stack.enter_context(patch("db.get_goals", return_value=goals))
             stack.enter_context(patch("db.get_day_log", return_value=self.empty_food_log()))
-            stack.enter_context(patch("db.get_activity_day", return_value={}))
             stack.enter_context(
-                patch("db.get_exercise_log", return_value=pd.DataFrame())
+                patch("activity_workflows.get_activity_day", return_value={})
+            )
+            stack.enter_context(
+                patch(
+                    "activity_workflows.get_exercise_log",
+                    return_value=pd.DataFrame(),
+                )
             )
             app = AppTest.from_file(str(APP_FILE))
             app.session_state["access_token"] = "token"
@@ -498,6 +506,95 @@ class AppSmokeTests(unittest.TestCase):
 
             self.assertEqual(len(app.exception), 0)
             self.assertIn("🏃 Actividad", [tab.label for tab in app.tabs])
+
+
+    def test_auth_screen_offers_password_recovery(self) -> None:
+        """Sin esto, un paciente que olvidaba su contraseña quedaba fuera."""
+        app = AppTest.from_file(str(APP_FILE)).run(timeout=20)
+        self.assertIn("Olvidé mi contraseña", [tab.label for tab in app.tabs])
+
+    def test_password_recovery_sends_the_email(self) -> None:
+        with patch("db.send_password_reset") as send_reset:
+            app = AppTest.from_file(str(APP_FILE)).run(timeout=20)
+            recover_email = next(
+                widget for widget in app.text_input
+                if widget.key == "recover_email"
+            )
+            recover_email.set_value("paciente@example.com")
+            next(
+                button for button in app.button if button.label == "Enviar enlace"
+            ).click().run(timeout=20)
+
+        self.assertEqual(len(app.exception), 0)
+        send_reset.assert_called_once()
+        self.assertEqual(send_reset.call_args.args[0], "paciente@example.com")
+
+    def test_recovery_answer_does_not_reveal_whether_the_account_exists(self) -> None:
+        with patch("db.send_password_reset", side_effect=RuntimeError("user not found")):
+            app = AppTest.from_file(str(APP_FILE)).run(timeout=20)
+            next(
+                widget for widget in app.text_input if widget.key == "recover_email"
+            ).set_value("desconocido@example.com")
+            next(
+                button for button in app.button if button.label == "Enviar enlace"
+            ).click().run(timeout=20)
+
+        self.assertEqual(len(app.exception), 0)
+        mensajes = " ".join(element.value for element in app.success)
+        self.assertIn("Si ese correo tiene una cuenta", mensajes)
+        self.assertEqual(len(app.error), 0)
+
+    def test_nutritionist_sees_the_patient_dashboard(self) -> None:
+        auth, own_profile, goals = self.nutritionist_context()
+        patient = {
+            "id": "patient-1", "name": "Paciente prueba", "age": 33,
+            "sex": "Masculino", "weight": 84, "height": 170,
+            "activity_level": "Moderada",
+        }
+        summary = pd.DataFrame(
+            [
+                {
+                    "patient_id": "patient-1", "patient_name": "Paciente prueba",
+                    "goal_calories": 2000, "last_log_date": "2026-08-18",
+                    "days_logged": 5, "avg_calories": 1950, "avg_protein": 100,
+                    "days_on_target": 4, "last_weight": 84.0,
+                    "last_weight_date": "2026-08-15",
+                },
+                {
+                    "patient_id": "patient-2", "patient_name": "Paciente inactivo",
+                    "goal_calories": 1800, "last_log_date": None,
+                    "days_logged": 0, "avg_calories": 0, "avg_protein": 0,
+                    "days_on_target": 0, "last_weight": None,
+                    "last_weight_date": None,
+                },
+            ]
+        )
+        with ExitStack() as stack:
+            stack.enter_context(patch("db.get_auth_context", return_value=auth))
+            stack.enter_context(patch("db.list_assigned_patients", return_value=[patient]))
+            stack.enter_context(patch("db.get_profile", return_value=own_profile))
+            stack.enter_context(patch("db.get_goals", return_value=goals))
+            stack.enter_context(patch("db.get_day_log", return_value=self.empty_food_log()))
+            stack.enter_context(
+                patch(
+                    "nutritionist_dashboard.get_patient_summary",
+                    return_value=summary,
+                )
+            )
+            stack.enter_context(
+                patch("app_timezone.local_today", return_value=date(2026, 8, 19))
+            )
+            app = AppTest.from_file(str(APP_FILE))
+            app.session_state["access_token"] = "token"
+            app.run(timeout=20)
+
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(app.sidebar.radio[0].options[0], "👥 Panel")
+            titulos = " ".join(element.value for element in app.title)
+            self.assertIn("Panel de pacientes", titulos)
+            # El paciente sin registros debe salir en la lista de seguimiento.
+            cuerpo = " ".join(element.value for element in app.markdown)
+            self.assertIn("Paciente inactivo", cuerpo)
 
 
 if __name__ == "__main__":

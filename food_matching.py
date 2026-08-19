@@ -24,11 +24,20 @@ STOPWORDS = {
 MIN_TERM_LENGTH = 3
 
 
+def fold_accents(value: object) -> str:
+    """Minúsculas sin acentos, conservando espacios y puntuación.
+
+    Debe coincidir con la columna `food_catalog.name_search`, que la base
+    calcula como `lower(unaccent(name))`. Si las dos normalizaciones difieren,
+    la búsqueda deja de encontrar alimentos.
+    """
+    text = unicodedata.normalize("NFD", str(value or "").lower())
+    return "".join(char for char in text if unicodedata.category(char) != "Mn")
+
+
 def normalize(value: object) -> str:
     """Minúsculas sin acentos ni puntuación, para comparar nombres."""
-    text = unicodedata.normalize("NFD", str(value or "").lower())
-    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
-    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return re.sub(r"[^a-z0-9]+", " ", fold_accents(value)).strip()
 
 
 def match_score(query: str, candidate: str) -> float:
